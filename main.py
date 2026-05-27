@@ -166,6 +166,45 @@ def round_float(value, digits: int = 5):
         return None
     return round(float(value), digits)
 
+def make_json_safe(value):
+    """
+    Converts pandas/numpy objects into normal JSON-safe Python values.
+    Prevents FastAPI Internal Server Error from numpy.bool_, numpy.float64,
+    pandas Timestamp, NaN, etc.
+    """
+    if isinstance(value, dict):
+        return {str(k): make_json_safe(v) for k, v in value.items()}
+
+    if isinstance(value, (list, tuple, set)):
+        return [make_json_safe(v) for v in value]
+
+    if isinstance(value, pd.Timestamp):
+        return str(value)
+
+    if isinstance(value, bool):
+        return bool(value)
+
+    if isinstance(value, (int, float, str)) or value is None:
+        try:
+            if pd.isna(value):
+                return None
+        except Exception:
+            pass
+        return value
+
+    if hasattr(value, "item"):
+        try:
+            return make_json_safe(value.item())
+        except Exception:
+            pass
+
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+
+    return str(value)
 
 def timeframe_to_minutes(timeframe: str) -> int:
     tf = timeframe.upper().replace(" ", "")
@@ -610,7 +649,7 @@ def market_snapshot_v1_1(
 
         return {
             "status": "ok",
-            "provider": "Twelve Data",
+            "provider": "Twelve Data",    
             "engine_version": "market_snapshot_v1_1",
             "asset_class": asset_class,
             "symbol": symbol.upper(),
@@ -621,8 +660,8 @@ def market_snapshot_v1_1(
             "candles_used": len(candles),
             "latest_candle_time": str(latest["datetime"]),
             "previous_candle_time": str(previous["datetime"]),
-            "session_context": sessions,
-            "freshness": freshness,
+            "session_context": make_json_safe(sessions),
+            "freshness": make_json_safe(freshness),
             "latest": {
                 "open": round_float(latest["open"]),
                 "high": round_float(latest["high"]),
@@ -650,10 +689,10 @@ def market_snapshot_v1_1(
             "raw_signal_action": signal.get("action"),
             "final_action": final_action,
             "reason": final_reason,
-            "confidence": confidence,
-            "checks": signal.get("checks"),
-            "hard_filters": hard_filters,
-            "warnings": warnings,
+            "confidence": make_json_safe(confidence),
+            "checks": make_json_safe(signal.get("checks")),
+            "hard_filters": make_json_safe(hard_filters),
+            "warnings": make_json_safe(warnings),
             "integrity_note": "Analytical signal only. Not financial advice. Do not execute without broker-side risk controls.",
             "next_upgrade": "Add spread filter, news filter, multi-timeframe confirmation, and backtest validation."
         }
