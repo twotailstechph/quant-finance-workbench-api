@@ -273,6 +273,48 @@ def check_candle_freshness(latest_dt: pd.Timestamp, timeframe: str):
         "is_fresh": bool(age_minutes <= max_allowed_age)
     }
 
+def select_confirmed_candles(df: pd.DataFrame, timeframe: str):
+    """
+    No-repaint confirmed-candle selector.
+    If the latest provider candle is still forming, ignore it and use the last fully closed candle.
+    Assumes provider candle timestamps are candle open times in UTC.
+    """
+    working = df.sort_values("datetime").reset_index(drop=True).copy()
+
+    tf_minutes = timeframe_to_minutes(timeframe)
+    now_utc = pd.Timestamp.now(tz="UTC").tz_localize(None)
+
+    provider_latest_open = pd.Timestamp(working.iloc[-1]["datetime"]).to_pydatetime().replace(tzinfo=None)
+    provider_latest_close = provider_latest_open + pd.Timedelta(minutes=tf_minutes)
+
+    ignored_forming_candle = now_utc < provider_latest_close
+
+    if ignored_forming_candle:
+        confirmed = working.iloc[:-1].copy().reset_index(drop=True)
+    else:
+        confirmed = working.copy().reset_index(drop=True)
+
+    if len(confirmed) == 0:
+        decision_open = None
+        decision_close = None
+    else:
+        decision_open = pd.Timestamp(confirmed.iloc[-1]["datetime"]).to_pydatetime().replace(tzinfo=None)
+        decision_close = decision_open + pd.Timedelta(minutes=tf_minutes)
+
+    return {
+        "candles": confirmed,
+        "mode": "confirmed_candle_only",
+        "timeframe": timeframe.upper(),
+        "now_utc": str(now_utc),
+        "provider_latest_candle_open_utc": str(provider_latest_open),
+        "provider_latest_candle_close_utc": str(provider_latest_close),
+        "ignored_forming_candle": bool(ignored_forming_candle),
+        "decision_candle_open_utc": str(decision_open) if decision_open is not None else None,
+        "decision_candle_close_utc": str(decision_close) if decision_close is not None else None,
+        "signal_delay_bars": 1 if ignored_forming_candle else 0,
+        "confirmed_candles_available": int(len(confirmed))
+    }
+
 
 def calculate_confidence_score(signal: dict, latest: pd.Series):
     """
@@ -803,7 +845,7 @@ def quant_forex_decision_stack_v1(
         entry_interval = normalize_timeframe(entry_timeframe)
         confirm_interval = normalize_timeframe(confirm_timeframe)
 
-        fetch_size = max(lookback_bars, 300)
+        fetch_size = max(lookback_bars + 5, 305)
 
         entry_candles = fetch_twelve_data_candles(
             symbol=normalized_symbol,
@@ -829,11 +871,31 @@ def quant_forex_decision_stack_v1(
                 "minimum_required": 220
             })
 
-        entry_candles = entry_candles.tail(lookback_bars).reset_index(drop=True)
-        confirm_candles = confirm_candles.tail(lookback_bars).reset_index(drop=True)
+        entry_confirmed_info = select_confirmed_candles(entry_candles, entry_timeframe)
+        confirm_confirmed_info = select_confirmed_candles(confirm_candles, confirm_timeframe)
 
-        entry_candles = calculate_indicators(entry_candles)
-        confirm_candles = calculate_indicators(confirm_candles)
+        entry_confirmed_candles = entry_confirmed_info["candles"]
+        confirm_confirmed_candles = confirm_confirmed_info["candles"]
+
+        if len(entry_confirmed_candles) < 220 or len(confirm_confirmed_candles) < 220:
+         return make_json_safe({
+        "status": "error",
+        "engine_version": "quant_forex_decision_stack_v1",
+        "symbol": symbol,
+        "final_action": "HOLD",
+        "reason": "Not enough confirmed candle data after removing forming candles.",
+        "entry_confirmed_candles": len(entry_confirmed_candles),
+        "confirm_confirmed_candles": len(confirm_confirmed_candles),
+        "minimum_required": 220,
+        "entry_confirmed_candle_mode": {k: v for k, v in entry_confirmed_info.items() if k != "candles"},
+        "confirm_confirmed_candle_mode": {k: v for k, v in confirm_confirmed_info.items() if k != "candles"}
+    })
+
+entry_candles = entry_confirmed_candles.tail(lookback_bars).reset_index(drop=True)
+confirm_candles = confirm_confirmed_candles.tail(lookback_bars).reset_index(drop=True)
+
+entry_candles = calculate_indicators(entry_candles)
+confirm_candles = calculate_indicators(confirm_candles)
 
         entry_signal = build_signal(entry_candles)
         confirm_bias = build_higher_timeframe_bias(confirm_candles, label=confirm_timeframe.upper())
@@ -903,7 +965,12 @@ def quant_forex_decision_stack_v1(
             "confirm_candles_used": len(confirm_candles),
             "latest_entry_candle_time": latest_entry["datetime"],
             "previous_entry_candle_time": previous_entry["datetime"],
-            "session_context": sessions,
+            "confirmed_candle_mode": {
+            "enabled": True,
+            "entry": {k: v for k, v in entry_confirmed_info.items() if k != "candles"},
+            "confirmation": {k: v for k, v in confirm_confirmed_info.items() if k != "candles"}
+},
+"session_context": sessions,
             "freshness": freshness,
             "entry_snapshot": {
                 "open": round_float(latest_entry["open"]),
