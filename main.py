@@ -384,6 +384,118 @@ def build_signal(df: pd.DataFrame):
 
     if rsi_overbought:
         warnings.append("RSI 14 is overbought. Avoid late BUY entries.")
+
+    if rsi_oversold:
+        warnings.append("RSI 14 is oversold. Avoid late SELL entries.")
+
+    if not macd_bullish_cross and not macd_bearish_cross:
+        warnings.append("No fresh MACD cross detected on the latest candle.")
+
+    if pd.notna(current["atr_14"]) and current["atr_14"] > 0:
+        if abs(close - ema_200) <= current["atr_14"] * 0.15:
+            warnings.append("Price is very close to EMA 200. Possible chop/compression zone.")
+
+    return {
+        "action": action,
+        "reason": reason,
+        "trend_state": trend_state,
+        "macd_state": macd_state,
+        "rsi_state": rsi_state,
+        "checks": {
+            "price_above_ema_200": bool(price_above_ema_200),
+            "price_below_ema_200": bool(price_below_ema_200),
+            "macd_bullish_cross": bool(macd_bullish_cross),
+            "macd_bearish_cross": bool(macd_bearish_cross),
+            "rsi_healthy_buy": bool(rsi_healthy_buy),
+            "rsi_healthy_sell": bool(rsi_healthy_sell),
+            "rsi_overbought": bool(rsi_overbought),
+            "rsi_oversold": bool(rsi_oversold)
+        },
+        "warnings": warnings
+    }
+
+def build_signal(df: pd.DataFrame):
+    """
+    Conservative M5 signal logic:
+    BUY only when price > EMA 200, fresh bullish MACD cross, and RSI healthy.
+    SELL only when price < EMA 200, fresh bearish MACD cross, and RSI healthy.
+    Otherwise HOLD.
+    """
+    if len(df) < 210:
+        return {
+            "action": "HOLD",
+            "reason": "Not enough candles to reliably calculate EMA 200 and momentum state.",
+            "trend_state": "unknown",
+            "macd_state": "unknown",
+            "rsi_state": "unknown",
+            "checks": {},
+            "warnings": ["Need at least 210 clean candles for this signal logic."]
+        }
+
+    current = df.iloc[-1]
+    previous = df.iloc[-2]
+
+    close = current["close"]
+    ema_200 = current["ema_200"]
+    rsi_14 = current["rsi_14"]
+
+    macd_line = current["macd_line"]
+    macd_signal = current["macd_signal"]
+
+    prev_macd_line = previous["macd_line"]
+    prev_macd_signal = previous["macd_signal"]
+
+    price_above_ema_200 = close > ema_200
+    price_below_ema_200 = close < ema_200
+
+    macd_bullish_cross = prev_macd_line <= prev_macd_signal and macd_line > macd_signal
+    macd_bearish_cross = prev_macd_line >= prev_macd_signal and macd_line < macd_signal
+
+    rsi_healthy_buy = 40 <= rsi_14 <= 70
+    rsi_healthy_sell = 30 <= rsi_14 <= 60
+    rsi_overbought = rsi_14 > 70
+    rsi_oversold = rsi_14 < 30
+
+    if price_above_ema_200:
+        trend_state = "bullish_above_ema_200"
+    elif price_below_ema_200:
+        trend_state = "bearish_below_ema_200"
+    else:
+        trend_state = "neutral_at_ema_200"
+
+    if macd_bullish_cross:
+        macd_state = "fresh_bullish_cross"
+    elif macd_bearish_cross:
+        macd_state = "fresh_bearish_cross"
+    elif macd_line > macd_signal:
+        macd_state = "bullish_but_no_fresh_cross"
+    elif macd_line < macd_signal:
+        macd_state = "bearish_but_no_fresh_cross"
+    else:
+        macd_state = "neutral"
+
+    if rsi_overbought:
+        rsi_state = "overbought"
+    elif rsi_oversold:
+        rsi_state = "oversold"
+    else:
+        rsi_state = "healthy"
+
+    action = "HOLD"
+    reason = "Conditions are mixed or no fresh confirmation."
+
+    if price_above_ema_200 and macd_bullish_cross and rsi_healthy_buy:
+        action = "BUY"
+        reason = "Price is above EMA 200, MACD has a fresh bullish cross, and RSI 14 is in a healthy buy momentum zone."
+
+    elif price_below_ema_200 and macd_bearish_cross and rsi_healthy_sell:
+        action = "SELL"
+        reason = "Price is below EMA 200, MACD has a fresh bearish cross, and RSI 14 is in a healthy sell momentum zone."
+
+    warnings = []
+
+    if rsi_overbought:
+        warnings.append("RSI 14 is overbought. Avoid late BUY entries.")
     if rsi_oversold:
         warnings.append("RSI 14 is oversold. Avoid late SELL entries.")
     if not macd_bullish_cross and not macd_bearish_cross:
