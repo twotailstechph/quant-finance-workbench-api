@@ -1900,9 +1900,11 @@ def quant_backtest_sweep_v1(
             "verdict": verdict,
             "best_result": best,
             "top_10_results": ranked[:10],
+            "valid_result_count": len(valid_results),
             "profitable_result_count": len(profitable),
             "negative_result_count": len(negative),
             "error_result_count": len(error_results),
+            "error_samples": error_results[:10],
             "integrity_note": "Parameter sweep is diagnostic only. It can reveal sensitivity and overfitting risk, but it does not prove future profitability.",
             "next_upgrade": "If no stable positive parameter zone appears, improve entry logic before adding execution."
         }
