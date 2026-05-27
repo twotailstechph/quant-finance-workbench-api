@@ -315,6 +315,40 @@ def select_confirmed_candles(df: pd.DataFrame, timeframe: str):
         "confirmed_candles_available": int(len(confirmed))
     }
 
+def evaluate_spread_filter(current_spread_pips: Optional[float], max_allowed_spread_pips: float = 1.5):
+    """
+    Spread filter / spread status gate.
+    For now, current_spread_pips is optional because the current provider does not supply broker spread.
+    Later, this should be connected to broker-side live bid/ask data.
+    """
+    if current_spread_pips is None:
+        return {
+            "spread_status": "unavailable",
+            "trade_allowed": True,
+            "current_spread_pips": None,
+            "max_allowed_spread_pips": max_allowed_spread_pips,
+            "reason": "Spread not provided. Not blocking in research mode, but live execution should require broker spread."
+        }
+
+    spread_value = float(current_spread_pips)
+    max_spread = float(max_allowed_spread_pips)
+
+    if spread_value <= max_spread:
+        return {
+            "spread_status": "normal",
+            "trade_allowed": True,
+            "current_spread_pips": spread_value,
+            "max_allowed_spread_pips": max_spread,
+            "reason": "Spread is within allowed threshold."
+        }
+
+    return {
+        "spread_status": "elevated",
+        "trade_allowed": False,
+        "current_spread_pips": spread_value,
+        "max_allowed_spread_pips": max_spread,
+        "reason": "Spread is above allowed threshold. Trade should be blocked."
+    }
 
 def calculate_confidence_score(signal: dict, latest: pd.Series):
     """
@@ -833,7 +867,9 @@ def quant_forex_decision_stack_v1(
     entry_timeframe: str = Query(default="M5"),
     confirm_timeframe: str = Query(default="M15"),
     lookback_bars: int = Query(default=300, ge=220, le=5000),
-    timezone: Optional[str] = Query(default="Asia/Manila")
+    timezone: Optional[str] = Query(default="Asia/Manila"),
+    current_spread_pips: Optional[float] = Query(default=None, ge=0),
+    max_allowed_spread_pips: float = Query(default=1.5, ge=0.1)
 ):
     """
     Quant Forex Decision Stack v1:
@@ -922,6 +958,8 @@ def quant_forex_decision_stack_v1(
         final_action = raw_action
         final_reason = entry_signal.get("reason", "No valid entry reason returned.")
         hard_filters = []
+        
+        spread_filter = evaluate_spread_filter(current_spread_pips, max_allowed_spread_pips)
 
         if raw_action == "BUY" and confirm_bias.get("bias") != "bullish":
             final_action = "HOLD"
@@ -943,6 +981,10 @@ def quant_forex_decision_stack_v1(
             final_action = "HOLD"
             hard_filters.append("Confidence score is below 60. Forced HOLD.")
 
+            if not spread_filter.get("trade_allowed", True):
+            final_action = "HOLD"
+            hard_filters.append("Spread is above allowed threshold. Forced HOLD.")
+        
         warnings = entry_signal.get("warnings", [])
 
         if hard_filters:
@@ -997,6 +1039,7 @@ def quant_forex_decision_stack_v1(
             "higher_timeframe_confirmation": confirm_bias,
             "compression_zone": compression_zone,
             "confidence": confidence,
+            "spread_filter": spread_filter,
             "final_action": final_action,
             "final_reason": final_reason,
             "hard_filters": hard_filters,
