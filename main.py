@@ -4133,3 +4133,527 @@ def quant_backtest_sweep_reclaim_walkforward_v1(
             "reason": "Walk-forward validation failed safely."
         })
 
+
+@app.get("/quant/backtest-sweep-reclaim-diagnostics-v1")
+def quant_backtest_sweep_reclaim_diagnostics_v1(
+    asset_class: str = Query(default="forex"),
+    symbol: str = Query(default="EURUSD"),
+    entry_timeframe: str = Query(default="M5"),
+    confirm_timeframe: str = Query(default="M15"),
+    regime_timeframe: str = Query(default="H1"),
+    lookback_bars: int = Query(default=3000, ge=1000, le=5000),
+    spread_pips: float = Query(default=0.8, ge=0),
+    slippage_pips: float = Query(default=0.2, ge=0),
+    max_allowed_spread_pips: float = Query(default=1.5, ge=0.1),
+    account_balance: float = Query(default=50.0, ge=1),
+    risk_percent: float = Query(default=1.0, ge=0.1, le=5.0),
+    pip_size: float = Query(default=0.0001, ge=0.00001),
+    pip_value_per_standard_lot: float = Query(default=10.0, ge=0.01),
+    broker_min_lot_size: float = Query(default=0.001, ge=0.0001),
+    broker_lot_step: float = Query(default=0.001, ge=0.0001),
+    swing_lookback: int = Query(default=12, ge=5, le=80),
+    stop_loss_pips: float = Query(default=8.0, ge=2, le=50),
+    reward_risk: float = Query(default=1.0, ge=0.5, le=5.0),
+    max_hold_bars: int = Query(default=24, ge=3, le=200),
+    cooldown_bars: int = Query(default=6, ge=0, le=100),
+    walkforward_windows: int = Query(default=5, ge=2, le=10),
+    min_total_trades_required: int = Query(default=20, ge=5, le=300),
+    min_profit_factor_required: float = Query(default=1.3, ge=1.0, le=5.0),
+    max_losing_streak_allowed: int = Query(default=4, ge=1, le=20)
+):
+    """
+    Sweep-Reclaim Diagnostics v1:
+    Diagnoses BUY vs SELL, session, and H1 regime alignment.
+    Purpose: identify whether SELL trades or regime conflicts caused walk-forward instability.
+    """
+    try:
+        def tf_to_minutes_local(tf: str):
+            t = str(tf).upper().strip()
+            if t.startswith("M"):
+                return int(t.replace("M", ""))
+            if t.startswith("H"):
+                return int(t.replace("H", "")) * 60
+            if t in ["1H", "60MIN", "60M"]:
+                return 60
+            return 60
+
+        def normalize_regime_interval(tf: str):
+            t = str(tf).upper().strip()
+            if t in ["H1", "1H", "60MIN", "60M"]:
+                return "1h"
+            return normalize_timeframe(tf)
+
+        normalized_symbol = normalize_symbol(symbol)
+        entry_interval = normalize_timeframe(entry_timeframe)
+        confirm_interval = normalize_timeframe(confirm_timeframe)
+        regime_interval = normalize_regime_interval(regime_timeframe)
+
+        fetch_size = max(lookback_bars + 100, 1200)
+
+        entry_raw = fetch_twelve_data_candles(
+            symbol=normalized_symbol,
+            interval=entry_interval,
+            outputsize=fetch_size
+        )
+
+        confirm_raw = fetch_twelve_data_candles(
+            symbol=normalized_symbol,
+            interval=confirm_interval,
+            outputsize=fetch_size
+        )
+
+        regime_raw = fetch_twelve_data_candles(
+            symbol=normalized_symbol,
+            interval=regime_interval,
+            outputsize=fetch_size
+        )
+
+        entry_confirmed_info = select_confirmed_candles(entry_raw, entry_timeframe)
+        confirm_confirmed_info = select_confirmed_candles(confirm_raw, confirm_timeframe)
+
+        entry_df = entry_confirmed_info["candles"].tail(lookback_bars).reset_index(drop=True)
+        confirm_df = confirm_confirmed_info["candles"].tail(lookback_bars).reset_index(drop=True)
+        regime_df = regime_raw.tail(lookback_bars).reset_index(drop=True)
+
+        if len(entry_df) < 500 or len(confirm_df) < 220 or len(regime_df) < 220:
+            return make_json_safe({
+                "status": "error",
+                "engine_version": "quant_backtest_sweep_reclaim_diagnostics_v1",
+                "symbol": symbol,
+                "reason": "Not enough candles for diagnostics.",
+                "entry_candles": len(entry_df),
+                "confirm_candles": len(confirm_df),
+                "regime_candles": len(regime_df)
+            })
+
+        entry_df = calculate_indicators(entry_df)
+        confirm_df = calculate_indicators(confirm_df)
+        regime_df = calculate_indicators(regime_df)
+
+        confirm_minutes = tf_to_minutes_local(confirm_timeframe)
+        regime_minutes = tf_to_minutes_local(regime_timeframe)
+
+        spread_filter_template = evaluate_spread_filter(spread_pips, max_allowed_spread_pips)
+        if spread_filter_template is None:
+            spread_filter_template = {
+                "spread_status": "error",
+                "trade_allowed": False,
+                "reason": "Spread filter returned None."
+            }
+
+        risk_gate_template = evaluate_low_capital_risk_gate(
+            account_balance=account_balance,
+            risk_percent=risk_percent,
+            stop_loss_pips=stop_loss_pips,
+            pip_value_per_standard_lot=pip_value_per_standard_lot,
+            broker_min_lot_size=broker_min_lot_size,
+            broker_lot_step=broker_lot_step
+        )
+
+        if risk_gate_template is None:
+            risk_gate_template = {
+                "risk_gate_status": "error",
+                "risk_gate_passed": False,
+                "reason": "Risk gate returned None."
+            }
+
+        total_cost_pips = float(spread_pips) + float(slippage_pips)
+        cost_r = total_cost_pips / float(stop_loss_pips) if stop_loss_pips > 0 else 0
+
+        variants = [
+            {"name": "both_no_h1_filter", "allowed_actions": ["BUY", "SELL"], "use_h1_filter": False},
+            {"name": "buy_only_no_h1_filter", "allowed_actions": ["BUY"], "use_h1_filter": False},
+            {"name": "sell_only_no_h1_filter", "allowed_actions": ["SELL"], "use_h1_filter": False},
+            {"name": "both_h1_aligned", "allowed_actions": ["BUY", "SELL"], "use_h1_filter": True},
+            {"name": "buy_only_h1_aligned", "allowed_actions": ["BUY"], "use_h1_filter": True},
+            {"name": "sell_only_h1_aligned", "allowed_actions": ["SELL"], "use_h1_filter": True}
+        ]
+
+        def summarize_trades(trades):
+            total_trades = len(trades)
+            wins = [t for t in trades if t["net_r_result"] > 0]
+            losses = [t for t in trades if t["net_r_result"] < 0]
+            breakeven = [t for t in trades if t["net_r_result"] == 0]
+
+            gross_win_r = sum(t["net_r_result"] for t in wins)
+            gross_loss_r = abs(sum(t["net_r_result"] for t in losses))
+
+            win_rate = (len(wins) / total_trades) * 100 if total_trades > 0 else 0
+            avg_r = (sum(t["net_r_result"] for t in trades) / total_trades) if total_trades > 0 else 0
+            total_r = sum(t["net_r_result"] for t in trades)
+
+            if gross_loss_r > 0:
+                profit_factor = gross_win_r / gross_loss_r
+            elif gross_win_r > 0:
+                profit_factor = 999.0
+            else:
+                profit_factor = None
+
+            max_losing_streak = 0
+            current_losing_streak = 0
+
+            for t in trades:
+                if t["net_r_result"] < 0:
+                    current_losing_streak += 1
+                    max_losing_streak = max(max_losing_streak, current_losing_streak)
+                else:
+                    current_losing_streak = 0
+
+            return {
+                "trades_taken": total_trades,
+                "wins": len(wins),
+                "losses": len(losses),
+                "breakeven": len(breakeven),
+                "win_rate_percent": round(win_rate, 2),
+                "total_r": round(total_r, 3),
+                "average_r": round(avg_r, 3),
+                "profit_factor": round(profit_factor, 3) if profit_factor is not None else None,
+                "max_losing_streak": max_losing_streak
+            }
+
+        def add_breakdown_trade(breakdown, key, trade):
+            if key not in breakdown:
+                breakdown[key] = []
+            breakdown[key].append(trade)
+
+        def summarize_breakdown(breakdown):
+            return {
+                str(k): summarize_trades(v)
+                for k, v in breakdown.items()
+            }
+
+        def get_confirm_slice_asof(decision_time):
+            decision_ts = pd.Timestamp(decision_time)
+            close_times = confirm_df["datetime"].apply(lambda x: pd.Timestamp(x) + pd.Timedelta(minutes=confirm_minutes))
+            return confirm_df[close_times <= decision_ts].reset_index(drop=True)
+
+        def get_regime_slice_asof(decision_time):
+            decision_ts = pd.Timestamp(decision_time)
+            close_times = regime_df["datetime"].apply(lambda x: pd.Timestamp(x) + pd.Timedelta(minutes=regime_minutes))
+            return regime_df[close_times <= decision_ts].reset_index(drop=True)
+
+        def simulate_variant(variant):
+            trades = []
+            block_counts = {}
+            raw_signal_counts = {"BUY": 0, "SELL": 0, "HOLD": 0}
+
+            def add_block(reason: str):
+                block_counts[reason] = block_counts.get(reason, 0) + 1
+
+            if not spread_filter_template.get("trade_allowed", True):
+                return {
+                    "variant": variant["name"],
+                    "summary": summarize_trades([]),
+                    "block_counts": {"Spread filter blocked all trades.": 1},
+                    "raw_signal_counts": raw_signal_counts
+                }
+
+            if not risk_gate_template.get("risk_gate_passed", True):
+                return {
+                    "variant": variant["name"],
+                    "summary": summarize_trades([]),
+                    "block_counts": {"Risk gate blocked all trades.": 1},
+                    "raw_signal_counts": raw_signal_counts
+                }
+
+            usable_start = max(220, swing_lookback + 10)
+            usable_end = len(entry_df) - max_hold_bars - 1
+            usable_length = usable_end - usable_start
+            window_size = int(usable_length / walkforward_windows)
+
+            last_trade_index = -999999
+
+            for i in range(usable_start, usable_end):
+                entry_slice = entry_df.iloc[:i + 1].reset_index(drop=True)
+                current = entry_slice.iloc[-1]
+                decision_time = current["datetime"]
+
+                confirm_slice = get_confirm_slice_asof(decision_time)
+                if len(confirm_slice) < 210:
+                    add_block("Not enough confirmed M15 structure candles.")
+                    continue
+
+                htf_bias_obj = build_htf_structure_bias_v1(confirm_slice, label=confirm_timeframe.upper())
+                htf_bias = htf_bias_obj.get("bias", "unknown")
+
+                signal = build_sweep_reclaim_signal_v1(
+                    entry_slice,
+                    htf_bias=htf_bias,
+                    swing_lookback=swing_lookback,
+                    reclaim_buffer_pips=1.0,
+                    pip_size=pip_size
+                )
+
+                if signal is None:
+                    signal = {"action": "HOLD", "reason": "Sweep-reclaim signal returned None."}
+
+                raw_action = signal.get("action", "HOLD")
+                raw_signal_counts[raw_action] = raw_signal_counts.get(raw_action, 0) + 1
+
+                if raw_action not in ["BUY", "SELL"]:
+                    continue
+
+                if raw_action not in variant["allowed_actions"]:
+                    add_block(f"{raw_action} blocked by variant side filter.")
+                    continue
+
+                regime_slice = get_regime_slice_asof(decision_time)
+                h1_bias = "unknown"
+
+                if len(regime_slice) >= 210:
+                    regime_bias_obj = build_htf_structure_bias_v1(regime_slice, label=regime_timeframe.upper())
+                    h1_bias = regime_bias_obj.get("bias", "unknown")
+                else:
+                    add_block("Not enough confirmed H1 regime candles.")
+
+                if variant["use_h1_filter"]:
+                    if raw_action == "BUY" and h1_bias != "bullish":
+                        add_block("H1 regime blocked BUY.")
+                        continue
+                    if raw_action == "SELL" and h1_bias != "bearish":
+                        add_block("H1 regime blocked SELL.")
+                        continue
+
+                if cooldown_bars > 0 and (i - last_trade_index) <= cooldown_bars:
+                    add_block("Cooldown blocked clustered trade.")
+                    continue
+
+                execution_bar = entry_df.iloc[i + 1]
+                entry_price = execution_bar["open"]
+                entry_time = execution_bar["datetime"]
+
+                sl_distance = stop_loss_pips * pip_size
+                tp_distance = stop_loss_pips * reward_risk * pip_size
+
+                if raw_action == "BUY":
+                    stop_price = entry_price - sl_distance
+                    target_price = entry_price + tp_distance
+                else:
+                    stop_price = entry_price + sl_distance
+                    target_price = entry_price - tp_distance
+
+                outcome = "timeout"
+                gross_r_result = 0.0
+                exit_time = None
+                final_j = min(i + 1 + max_hold_bars, len(entry_df) - 1)
+
+                for j in range(i + 1, final_j + 1):
+                    bar = entry_df.iloc[j]
+                    high = bar["high"]
+                    low = bar["low"]
+
+                    if raw_action == "BUY":
+                        hit_stop = low <= stop_price
+                        hit_target = high >= target_price
+
+                        if hit_stop and hit_target:
+                            outcome = "loss"
+                            gross_r_result = -1.0
+                            exit_time = bar["datetime"]
+                            break
+                        if hit_stop:
+                            outcome = "loss"
+                            gross_r_result = -1.0
+                            exit_time = bar["datetime"]
+                            break
+                        if hit_target:
+                            outcome = "win"
+                            gross_r_result = reward_risk
+                            exit_time = bar["datetime"]
+                            break
+
+                    if raw_action == "SELL":
+                        hit_stop = high >= stop_price
+                        hit_target = low <= target_price
+
+                        if hit_stop and hit_target:
+                            outcome = "loss"
+                            gross_r_result = -1.0
+                            exit_time = bar["datetime"]
+                            break
+                        if hit_stop:
+                            outcome = "loss"
+                            gross_r_result = -1.0
+                            exit_time = bar["datetime"]
+                            break
+                        if hit_target:
+                            outcome = "win"
+                            gross_r_result = reward_risk
+                            exit_time = bar["datetime"]
+                            break
+
+                if outcome == "timeout":
+                    timeout_bar = entry_df.iloc[final_j]
+                    exit_price = timeout_bar["close"]
+                    exit_time = timeout_bar["datetime"]
+
+                    if raw_action == "BUY":
+                        pnl_pips = (exit_price - entry_price) / pip_size
+                    else:
+                        pnl_pips = (entry_price - exit_price) / pip_size
+
+                    gross_r_result = round(pnl_pips / stop_loss_pips, 3)
+
+                    if gross_r_result > 0:
+                        outcome = "timeout_win"
+                    elif gross_r_result < 0:
+                        outcome = "timeout_loss"
+                    else:
+                        outcome = "breakeven"
+
+                net_r_result = round(gross_r_result - cost_r, 3)
+                last_trade_index = i
+
+                session_context = classify_trading_session(pd.Timestamp(entry_time))
+
+                window_number = int(((i - usable_start) / window_size) + 1) if window_size > 0 else 1
+                if window_number > walkforward_windows:
+                    window_number = walkforward_windows
+
+                trades.append({
+                    "decision_time": decision_time,
+                    "entry_time": entry_time,
+                    "exit_time": exit_time,
+                    "action": raw_action,
+                    "outcome": outcome,
+                    "gross_r_result": round(gross_r_result, 3),
+                    "cost_r": round(cost_r, 3),
+                    "net_r_result": net_r_result,
+                    "m15_bias": htf_bias,
+                    "h1_bias": h1_bias,
+                    "window_number": window_number,
+                    "session_context": session_context,
+                    "signal_reason": signal.get("reason")
+                })
+
+            side_breakdown = {}
+            h1_breakdown = {}
+            session_breakdown = {}
+            window_breakdown = {}
+
+            for t in trades:
+                add_breakdown_trade(side_breakdown, t["action"], t)
+                add_breakdown_trade(h1_breakdown, t["h1_bias"], t)
+                add_breakdown_trade(window_breakdown, t["window_number"], t)
+
+                for session in t.get("session_context", []):
+                    add_breakdown_trade(session_breakdown, session, t)
+
+            summary = summarize_trades(trades)
+            side_summary = summarize_breakdown(side_breakdown)
+            h1_summary = summarize_breakdown(h1_breakdown)
+            session_summary = summarize_breakdown(session_breakdown)
+            window_summary = summarize_breakdown(window_breakdown)
+
+            pf = summary["profit_factor"] or 0
+            passed_candidate = (
+                summary["trades_taken"] >= min_total_trades_required
+                and summary["total_r"] > 0
+                and pf >= min_profit_factor_required
+                and summary["max_losing_streak"] <= max_losing_streak_allowed
+            )
+
+            rank_score = (
+                (summary["total_r"] * 10)
+                + (summary["average_r"] * 100)
+                + (pf * 5)
+                - (summary["max_losing_streak"] * 3)
+            )
+
+            if not passed_candidate:
+                rank_score -= 50
+
+            return {
+                "variant": variant["name"],
+                "allowed_actions": variant["allowed_actions"],
+                "use_h1_filter": variant["use_h1_filter"],
+                "passed_candidate_gates": bool(passed_candidate),
+                "rank_score": round(rank_score, 3),
+                "summary": summary,
+                "side_breakdown": side_summary,
+                "h1_regime_breakdown": h1_summary,
+                "session_breakdown": session_summary,
+                "window_breakdown": window_summary,
+                "block_counts": block_counts,
+                "raw_signal_counts": raw_signal_counts,
+                "recent_trades_sample": trades[-10:]
+            }
+
+        variant_results = [simulate_variant(v) for v in variants]
+
+        ranked_variants = sorted(
+            variant_results,
+            key=lambda x: (
+                x.get("rank_score", -999),
+                x.get("summary", {}).get("total_r", -999),
+                x.get("summary", {}).get("profit_factor") or 0
+            ),
+            reverse=True
+        )
+
+        best_variant = ranked_variants[0] if ranked_variants else None
+
+        verdict = "diagnostics_complete"
+
+        if best_variant:
+            if best_variant.get("passed_candidate_gates"):
+                verdict = "diagnostics_found_candidate_variant"
+            elif best_variant.get("summary", {}).get("total_r", 0) > 0:
+                verdict = "positive_variant_but_stability_gates_failed"
+            else:
+                verdict = "no_variant_validated"
+
+        response = {
+            "status": "ok",
+            "engine_version": "quant_backtest_sweep_reclaim_diagnostics_v1",
+            "strategy_mode": "sweep_reclaim_diagnostics_v1",
+            "asset_class": asset_class,
+            "symbol": symbol.upper(),
+            "normalized_symbol": normalized_symbol,
+            "entry_timeframe": entry_timeframe.upper(),
+            "confirm_timeframe": confirm_timeframe.upper(),
+            "regime_timeframe": regime_timeframe.upper(),
+            "lookback_bars": lookback_bars,
+            "candidate": {
+                "swing_lookback": swing_lookback,
+                "stop_loss_pips": stop_loss_pips,
+                "reward_risk": reward_risk,
+                "max_hold_bars": max_hold_bars,
+                "cooldown_bars": cooldown_bars
+            },
+            "execution_cost_model": {
+                "spread_pips": spread_pips,
+                "slippage_pips": slippage_pips,
+                "total_cost_pips": round(total_cost_pips, 3),
+                "cost_r_per_trade": round(cost_r, 3)
+            },
+            "risk_model": {
+                "account_balance": account_balance,
+                "risk_percent": risk_percent,
+                "risk_gate": risk_gate_template
+            },
+            "diagnostic_variants_tested": [v["name"] for v in variants],
+            "validation_gate_requirements": {
+                "min_total_trades_required": min_total_trades_required,
+                "min_profit_factor_required": min_profit_factor_required,
+                "max_losing_streak_allowed": max_losing_streak_allowed
+            },
+            "verdict": verdict,
+            "best_variant": best_variant,
+            "variant_rankings": ranked_variants,
+            "integrity_note": "Diagnostics are research-only. They identify weak sides/regimes but do not prove future profitability.",
+            "next_upgrade": "Promote the best diagnostic variant into a walk-forward candidate only if it passes stability gates."
+        }
+
+        return make_json_safe(response)
+
+    except Exception as e:
+        return make_json_safe({
+            "status": "error",
+            "engine_version": "quant_backtest_sweep_reclaim_diagnostics_v1",
+            "strategy_mode": "sweep_reclaim_diagnostics_v1",
+            "symbol": symbol,
+            "error": str(e),
+            "reason": "Sweep-reclaim diagnostics failed safely."
+        })
+
