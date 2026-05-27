@@ -1053,7 +1053,7 @@ def quant_forex_decision_stack_v1(
         hard_filters = []
         
         spread_filter = evaluate_spread_filter(current_spread_pips, max_allowed_spread_pips)
-            risk_gate = evaluate_low_capital_risk_gate(
+        risk_gate = evaluate_low_capital_risk_gate(
             account_balance=account_balance,
             risk_percent=risk_percent,
             stop_loss_pips=stop_loss_pips,
