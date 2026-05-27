@@ -1045,7 +1045,7 @@ def quant_forex_decision_stack_v1(
             "hard_filters": hard_filters,
             "warnings": warnings,
             "integrity_note": "Analytical signal only. Not financial advice. No live execution permission.",
-            "next_upgrade": "Add spread filter, news filter, and backtest validation."
+            "next_upgrade": "Add backtest validation, session performance breakdown, and news filter."
         }
 
         return make_json_safe(response)
