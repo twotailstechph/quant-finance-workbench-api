@@ -1085,6 +1085,54 @@ def quant_forex_decision_stack_v1(
                 "reason": "Risk gate returned None. Forced HOLD."
             }
 
+        # SAFE NONE NORMALIZATION BLOCK
+        # Prevents any helper returning None from crashing the endpoint.
+        if entry_signal is None:
+            entry_signal = {
+                "action": "HOLD",
+                "reason": "Entry signal returned None. Forced HOLD.",
+                "trend_state": "unknown",
+                "macd_state": "unknown",
+                "rsi_state": "unknown",
+                "checks": {},
+                "warnings": ["Entry signal returned None."]
+            }
+
+        if confirm_bias is None:
+            confirm_bias = {
+                "timeframe": confirm_timeframe.upper(),
+                "bias": "unknown",
+                "reason": "Higher-timeframe confirmation returned None. Forced HOLD.",
+                "checks": {}
+            }
+
+        if freshness is None:
+            freshness = {
+                "is_fresh": False,
+                "reason": "Freshness check returned None. Forced HOLD."
+            }
+
+        if confidence is None:
+            confidence = {
+                "score": 0,
+                "label": "weak_or_no_trade",
+                "reasons": ["Confidence calculation returned None."]
+            }
+
+        if spread_filter is None:
+            spread_filter = {
+                "spread_status": "error",
+                "trade_allowed": False,
+                "reason": "Spread filter returned None. Forced HOLD."
+            }
+
+        if risk_gate is None:
+            risk_gate = {
+                "risk_gate_status": "error",
+                "risk_gate_passed": False,
+                "reason": "Risk gate returned None. Forced HOLD."
+            }
+
         if raw_action == "BUY" and confirm_bias.get("bias") != "bullish":
             final_action = "HOLD"
             hard_filters.append("M15 confirmation does not support BUY. Forced HOLD.")
