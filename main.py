@@ -2462,3 +2462,692 @@ def quant_backtest_sweep_v1_1(
             "reason": "Cached backtest sweep failed safely."
         })
 
+
+def build_htf_structure_bias_v1(df: pd.DataFrame, label: str = "M15"):
+    """
+    Structure-based higher timeframe bias.
+    Uses close vs EMA 200, not MACD, to avoid over-blocking structure trades.
+    """
+    try:
+        if len(df) < 210:
+            return {
+                "timeframe": label,
+                "bias": "unknown",
+                "reason": "Not enough candles for structure bias.",
+                "checks": {}
+            }
+
+        latest = df.iloc[-1]
+        close = latest["close"]
+        ema_200 = latest["ema_200"]
+
+        price_above_ema_200 = close > ema_200
+        price_below_ema_200 = close < ema_200
+
+        if price_above_ema_200:
+            bias = "bullish"
+            reason = f"{label} structure bias is bullish: close is above EMA 200."
+        elif price_below_ema_200:
+            bias = "bearish"
+            reason = f"{label} structure bias is bearish: close is below EMA 200."
+        else:
+            bias = "mixed"
+            reason = f"{label} structure bias is mixed."
+
+        return {
+            "timeframe": label,
+            "bias": bias,
+            "reason": reason,
+            "latest": {
+                "close": round_float(close),
+                "ema_200": round_float(ema_200),
+                "rsi_14": round_float(latest["rsi_14"], 2) if "rsi_14" in latest else None
+            },
+            "checks": {
+                "price_above_ema_200": bool(price_above_ema_200),
+                "price_below_ema_200": bool(price_below_ema_200)
+            }
+        }
+
+    except Exception as e:
+        return {
+            "timeframe": label,
+            "bias": "unknown",
+            "reason": "Structure bias calculation failed.",
+            "error": str(e),
+            "checks": {}
+        }
+
+
+def build_sweep_reclaim_signal_v1(
+    df: pd.DataFrame,
+    htf_bias: str,
+    swing_lookback: int = 20,
+    reclaim_buffer_pips: float = 1.0,
+    pip_size: float = 0.0001
+):
+    """
+    M5 sweep-reclaim entry signal.
+    BUY: price sweeps recent low, then reclaims above that low while HTF bias is bullish.
+    SELL: price sweeps recent high, then reclaims below that high while HTF bias is bearish.
+    """
+    try:
+        min_required = swing_lookback + 5
+
+        if len(df) < min_required:
+            return {
+                "action": "HOLD",
+                "reason": "Not enough candles for sweep-reclaim detection.",
+                "strategy": "sweep_reclaim_v1",
+                "checks": {},
+                "warnings": []
+            }
+
+        working = df.reset_index(drop=True)
+        latest = working.iloc[-1]
+        sweep_window = working.iloc[-3:]
+
+        level_window = working.iloc[-(swing_lookback + 3):-3]
+
+        recent_low = float(level_window["low"].min())
+        recent_high = float(level_window["high"].max())
+
+        sweep_low = float(sweep_window["low"].min())
+        sweep_high = float(sweep_window["high"].max())
+
+        latest_close = float(latest["close"])
+        latest_rsi = float(latest["rsi_14"]) if "rsi_14" in latest and not pd.isna(latest["rsi_14"]) else None
+
+        buffer = reclaim_buffer_pips * pip_size
+
+        bullish_sweep = sweep_low < (recent_low - buffer)
+        bullish_reclaim = latest_close > (recent_low + buffer)
+
+        bearish_sweep = sweep_high > (recent_high + buffer)
+        bearish_reclaim = latest_close < (recent_high - buffer)
+
+        rsi_buy_ok = latest_rsi is None or latest_rsi < 70
+        rsi_sell_ok = latest_rsi is None or latest_rsi > 30
+
+        action = "HOLD"
+        reason = "No valid sweep-reclaim setup."
+
+        if htf_bias == "bullish" and bullish_sweep and bullish_reclaim and rsi_buy_ok:
+            action = "BUY"
+            reason = "Bullish sweep-reclaim detected with bullish higher-timeframe structure."
+
+        elif htf_bias == "bearish" and bearish_sweep and bearish_reclaim and rsi_sell_ok:
+            action = "SELL"
+            reason = "Bearish sweep-reclaim detected with bearish higher-timeframe structure."
+
+        warnings = []
+
+        if latest_rsi is not None and latest_rsi >= 70:
+            warnings.append("RSI is high; bullish entry blocked or lower quality.")
+
+        if latest_rsi is not None and latest_rsi <= 30:
+            warnings.append("RSI is low; bearish entry blocked or lower quality.")
+
+        return {
+            "action": action,
+            "reason": reason,
+            "strategy": "sweep_reclaim_v1",
+            "htf_bias": htf_bias,
+            "levels": {
+                "recent_low": round(recent_low, 5),
+                "recent_high": round(recent_high, 5),
+                "sweep_low": round(sweep_low, 5),
+                "sweep_high": round(sweep_high, 5),
+                "latest_close": round(latest_close, 5),
+                "reclaim_buffer_pips": reclaim_buffer_pips
+            },
+            "checks": {
+                "bullish_sweep": bool(bullish_sweep),
+                "bullish_reclaim": bool(bullish_reclaim),
+                "bearish_sweep": bool(bearish_sweep),
+                "bearish_reclaim": bool(bearish_reclaim),
+                "rsi_buy_ok": bool(rsi_buy_ok),
+                "rsi_sell_ok": bool(rsi_sell_ok)
+            },
+            "warnings": warnings
+        }
+
+    except Exception as e:
+        return {
+            "action": "HOLD",
+            "reason": "Sweep-reclaim signal calculation failed.",
+            "strategy": "sweep_reclaim_v1",
+            "error": str(e),
+            "checks": {},
+            "warnings": ["Sweep-reclaim signal failed safely."]
+        }
+
+
+@app.get("/quant/backtest-sweep-reclaim-v1")
+def quant_backtest_sweep_reclaim_v1(
+    asset_class: str = Query(default="forex"),
+    symbol: str = Query(default="EURUSD"),
+    entry_timeframe: str = Query(default="M5"),
+    confirm_timeframe: str = Query(default="M15"),
+    lookback_bars: int = Query(default=1000, ge=300, le=5000),
+    spread_pips: float = Query(default=0.8, ge=0),
+    max_allowed_spread_pips: float = Query(default=1.5, ge=0.1),
+    account_balance: float = Query(default=50.0, ge=1),
+    risk_percent: float = Query(default=1.0, ge=0.1, le=5.0),
+    pip_size: float = Query(default=0.0001, ge=0.00001),
+    pip_value_per_standard_lot: float = Query(default=10.0, ge=0.01),
+    broker_min_lot_size: float = Query(default=0.001, ge=0.0001),
+    broker_lot_step: float = Query(default=0.001, ge=0.0001),
+    min_trades_required: int = Query(default=5, ge=1, le=100)
+):
+    """
+    Sweep-Reclaim Backtest v1:
+    Tests a structure-based entry model instead of the failed EMA/MACD/RSI entry trigger.
+    """
+    try:
+        swing_lookback_tests = [12, 20, 30]
+        stop_loss_tests = [8, 10, 15, 20]
+        reward_risk_tests = [1.0, 1.2, 1.5]
+        max_hold_tests = [12, 24]
+
+        normalized_symbol = normalize_symbol(symbol)
+        entry_interval = normalize_timeframe(entry_timeframe)
+        confirm_interval = normalize_timeframe(confirm_timeframe)
+
+        fetch_size = max(lookback_bars + 100, 400)
+
+        entry_raw = fetch_twelve_data_candles(
+            symbol=normalized_symbol,
+            interval=entry_interval,
+            outputsize=fetch_size
+        )
+
+        confirm_raw = fetch_twelve_data_candles(
+            symbol=normalized_symbol,
+            interval=confirm_interval,
+            outputsize=fetch_size
+        )
+
+        entry_confirmed_info = select_confirmed_candles(entry_raw, entry_timeframe)
+        confirm_confirmed_info = select_confirmed_candles(confirm_raw, confirm_timeframe)
+
+        entry_df = entry_confirmed_info["candles"].tail(lookback_bars).reset_index(drop=True)
+        confirm_df = confirm_confirmed_info["candles"].tail(lookback_bars).reset_index(drop=True)
+
+        if len(entry_df) < 250 or len(confirm_df) < 220:
+            return make_json_safe({
+                "status": "error",
+                "engine_version": "quant_backtest_sweep_reclaim_v1",
+                "symbol": symbol,
+                "reason": "Not enough confirmed candles for sweep-reclaim backtest.",
+                "entry_candles": len(entry_df),
+                "confirm_candles": len(confirm_df)
+            })
+
+        entry_df = calculate_indicators(entry_df)
+        confirm_df = calculate_indicators(confirm_df)
+
+        spread_filter_template = evaluate_spread_filter(spread_pips, max_allowed_spread_pips)
+
+        if spread_filter_template is None:
+            spread_filter_template = {
+                "spread_status": "error",
+                "trade_allowed": False,
+                "reason": "Spread filter returned None."
+            }
+
+        results = []
+        error_results = []
+
+        def simulate_combo(swing_lookback: int, stop_loss_pips: float, reward_risk: float, max_hold_bars: int):
+            trades = []
+            block_counts = {}
+            raw_signal_counts = {
+                "BUY": 0,
+                "SELL": 0,
+                "HOLD": 0
+            }
+
+            def add_block(reason: str):
+                block_counts[reason] = block_counts.get(reason, 0) + 1
+
+            risk_gate_template = evaluate_low_capital_risk_gate(
+                account_balance=account_balance,
+                risk_percent=risk_percent,
+                stop_loss_pips=stop_loss_pips,
+                pip_value_per_standard_lot=pip_value_per_standard_lot,
+                broker_min_lot_size=broker_min_lot_size,
+                broker_lot_step=broker_lot_step
+            )
+
+            if risk_gate_template is None:
+                risk_gate_template = {
+                    "risk_gate_status": "error",
+                    "risk_gate_passed": False,
+                    "reason": "Risk gate returned None."
+                }
+
+            if not spread_filter_template.get("trade_allowed", True):
+                return {
+                    "status": "ok",
+                    "swing_lookback": swing_lookback,
+                    "stop_loss_pips": stop_loss_pips,
+                    "reward_risk": reward_risk,
+                    "max_hold_bars": max_hold_bars,
+                    "rank_score": -999,
+                    "trades_taken": 0,
+                    "wins": 0,
+                    "losses": 0,
+                    "win_rate_percent": 0,
+                    "total_r": 0,
+                    "average_r": 0,
+                    "profit_factor": None,
+                    "max_losing_streak": 0,
+                    "raw_signal_counts": raw_signal_counts,
+                    "block_counts": {"Spread filter blocked all trades.": 1},
+                    "risk_gate_template": risk_gate_template
+                }
+
+            if not risk_gate_template.get("risk_gate_passed", True):
+                return {
+                    "status": "ok",
+                    "swing_lookback": swing_lookback,
+                    "stop_loss_pips": stop_loss_pips,
+                    "reward_risk": reward_risk,
+                    "max_hold_bars": max_hold_bars,
+                    "rank_score": -999,
+                    "trades_taken": 0,
+                    "wins": 0,
+                    "losses": 0,
+                    "win_rate_percent": 0,
+                    "total_r": 0,
+                    "average_r": 0,
+                    "profit_factor": None,
+                    "max_losing_streak": 0,
+                    "raw_signal_counts": raw_signal_counts,
+                    "block_counts": {"Risk gate blocked all trades.": 1},
+                    "risk_gate_template": risk_gate_template
+                }
+
+            start_index = max(220, swing_lookback + 10)
+            end_index = len(entry_df) - max_hold_bars - 1
+
+            if end_index <= start_index:
+                return {
+                    "status": "error",
+                    "swing_lookback": swing_lookback,
+                    "stop_loss_pips": stop_loss_pips,
+                    "reward_risk": reward_risk,
+                    "max_hold_bars": max_hold_bars,
+                    "reason": "Not enough candles after warmup."
+                }
+
+            for i in range(start_index, end_index):
+                entry_slice = entry_df.iloc[:i + 1].reset_index(drop=True)
+                current = entry_slice.iloc[-1]
+                decision_time = current["datetime"]
+
+                confirm_slice = confirm_df[confirm_df["datetime"] <= decision_time].reset_index(drop=True)
+
+                if len(confirm_slice) < 210:
+                    add_block("Not enough M15 structure candles.")
+                    continue
+
+                htf_bias_obj = build_htf_structure_bias_v1(confirm_slice, label=confirm_timeframe.upper())
+                htf_bias = htf_bias_obj.get("bias", "unknown")
+
+                signal = build_sweep_reclaim_signal_v1(
+                    entry_slice,
+                    htf_bias=htf_bias,
+                    swing_lookback=swing_lookback,
+                    reclaim_buffer_pips=1.0,
+                    pip_size=pip_size
+                )
+
+                if signal is None:
+                    signal = {
+                        "action": "HOLD",
+                        "reason": "Sweep-reclaim signal returned None.",
+                        "checks": {},
+                        "warnings": []
+                    }
+
+                raw_action = signal.get("action", "HOLD")
+                raw_signal_counts[raw_action] = raw_signal_counts.get(raw_action, 0) + 1
+
+                if raw_action not in ["BUY", "SELL"]:
+                    continue
+
+                confidence_score = 70
+
+                if signal.get("checks", {}).get("bullish_reclaim") or signal.get("checks", {}).get("bearish_reclaim"):
+                    confidence_score += 10
+
+                if htf_bias in ["bullish", "bearish"]:
+                    confidence_score += 10
+
+                confidence_score = min(confidence_score, 100)
+
+                execution_bar = entry_df.iloc[i + 1]
+                entry_price = execution_bar["open"]
+                entry_time = execution_bar["datetime"]
+
+                sl_distance = stop_loss_pips * pip_size
+                tp_distance = stop_loss_pips * reward_risk * pip_size
+
+                if raw_action == "BUY":
+                    stop_price = entry_price - sl_distance
+                    target_price = entry_price + tp_distance
+                else:
+                    stop_price = entry_price + sl_distance
+                    target_price = entry_price - tp_distance
+
+                outcome = "timeout"
+                r_result = 0.0
+                exit_price = None
+                exit_time = None
+
+                final_j = min(i + 1 + max_hold_bars, len(entry_df) - 1)
+
+                for j in range(i + 1, final_j + 1):
+                    bar = entry_df.iloc[j]
+                    high = bar["high"]
+                    low = bar["low"]
+
+                    if raw_action == "BUY":
+                        hit_stop = low <= stop_price
+                        hit_target = high >= target_price
+
+                        if hit_stop and hit_target:
+                            outcome = "loss"
+                            r_result = -1.0
+                            exit_price = stop_price
+                            exit_time = bar["datetime"]
+                            break
+
+                        if hit_stop:
+                            outcome = "loss"
+                            r_result = -1.0
+                            exit_price = stop_price
+                            exit_time = bar["datetime"]
+                            break
+
+                        if hit_target:
+                            outcome = "win"
+                            r_result = reward_risk
+                            exit_price = target_price
+                            exit_time = bar["datetime"]
+                            break
+
+                    if raw_action == "SELL":
+                        hit_stop = high >= stop_price
+                        hit_target = low <= target_price
+
+                        if hit_stop and hit_target:
+                            outcome = "loss"
+                            r_result = -1.0
+                            exit_price = stop_price
+                            exit_time = bar["datetime"]
+                            break
+
+                        if hit_stop:
+                            outcome = "loss"
+                            r_result = -1.0
+                            exit_price = stop_price
+                            exit_time = bar["datetime"]
+                            break
+
+                        if hit_target:
+                            outcome = "win"
+                            r_result = reward_risk
+                            exit_price = target_price
+                            exit_time = bar["datetime"]
+                            break
+
+                if outcome == "timeout":
+                    timeout_bar = entry_df.iloc[final_j]
+                    exit_price = timeout_bar["close"]
+                    exit_time = timeout_bar["datetime"]
+
+                    if raw_action == "BUY":
+                        pnl_pips = (exit_price - entry_price) / pip_size
+                    else:
+                        pnl_pips = (entry_price - exit_price) / pip_size
+
+                    r_result = round(pnl_pips / stop_loss_pips, 3)
+
+                    if r_result > 0:
+                        outcome = "timeout_win"
+                    elif r_result < 0:
+                        outcome = "timeout_loss"
+                    else:
+                        outcome = "breakeven"
+
+                session_context = classify_trading_session(pd.Timestamp(entry_time))
+
+                trades.append({
+                    "decision_time": decision_time,
+                    "entry_time": entry_time,
+                    "exit_time": exit_time,
+                    "action": raw_action,
+                    "outcome": outcome,
+                    "r_result": round(r_result, 3),
+                    "confidence_score": confidence_score,
+                    "htf_bias": htf_bias,
+                    "session_context": session_context,
+                    "spread_status": spread_filter_template.get("spread_status"),
+                    "risk_gate_status": risk_gate_template.get("risk_gate_status"),
+                    "rounded_lot_size": risk_gate_template.get("rounded_lot_size"),
+                    "signal_reason": signal.get("reason")
+                })
+
+            total_trades = len(trades)
+            wins = [t for t in trades if t["r_result"] > 0]
+            losses = [t for t in trades if t["r_result"] < 0]
+            breakeven = [t for t in trades if t["r_result"] == 0]
+
+            gross_win_r = sum(t["r_result"] for t in wins)
+            gross_loss_r = abs(sum(t["r_result"] for t in losses))
+
+            win_rate = (len(wins) / total_trades) * 100 if total_trades > 0 else 0
+            avg_r = (sum(t["r_result"] for t in trades) / total_trades) if total_trades > 0 else 0
+            total_r = sum(t["r_result"] for t in trades)
+            profit_factor = (gross_win_r / gross_loss_r) if gross_loss_r > 0 else None
+
+            max_losing_streak = 0
+            current_losing_streak = 0
+
+            for t in trades:
+                if t["r_result"] < 0:
+                    current_losing_streak += 1
+                    max_losing_streak = max(max_losing_streak, current_losing_streak)
+                else:
+                    current_losing_streak = 0
+
+            session_breakdown = {}
+
+            for t in trades:
+                for session in t.get("session_context", []):
+                    if session not in session_breakdown:
+                        session_breakdown[session] = {
+                            "trades": 0,
+                            "wins": 0,
+                            "losses": 0,
+                            "total_r": 0.0
+                        }
+
+                    session_breakdown[session]["trades"] += 1
+                    session_breakdown[session]["total_r"] += t["r_result"]
+
+                    if t["r_result"] > 0:
+                        session_breakdown[session]["wins"] += 1
+                    elif t["r_result"] < 0:
+                        session_breakdown[session]["losses"] += 1
+
+            for session, stats in session_breakdown.items():
+                trades_count = stats["trades"]
+                stats["win_rate"] = round((stats["wins"] / trades_count) * 100, 2) if trades_count else 0
+                stats["avg_r"] = round(stats["total_r"] / trades_count, 3) if trades_count else 0
+                stats["total_r"] = round(stats["total_r"], 3)
+
+            if total_trades < min_trades_required:
+                rank_score = -999
+            else:
+                pf_component = profit_factor if profit_factor is not None else 0
+                rank_score = (
+                    (float(total_r) * 10)
+                    + (float(avg_r) * 100)
+                    + (float(pf_component) * 5)
+                    - (float(max_losing_streak) * 2)
+                )
+
+            return {
+                "status": "ok",
+                "strategy_mode": "sweep_reclaim_v1",
+                "swing_lookback": swing_lookback,
+                "stop_loss_pips": stop_loss_pips,
+                "reward_risk": reward_risk,
+                "max_hold_bars": max_hold_bars,
+                "rank_score": round(rank_score, 3),
+                "trades_taken": total_trades,
+                "wins": len(wins),
+                "losses": len(losses),
+                "breakeven": len(breakeven),
+                "win_rate_percent": round(win_rate, 2),
+                "total_r": round(total_r, 3),
+                "average_r": round(avg_r, 3),
+                "profit_factor": round(profit_factor, 3) if profit_factor is not None else None,
+                "max_losing_streak": max_losing_streak,
+                "raw_signal_counts": raw_signal_counts,
+                "block_counts": block_counts,
+                "session_breakdown": session_breakdown,
+                "risk_gate_template": risk_gate_template,
+                "recent_trades_sample": trades[-5:]
+            }
+
+        for swing in swing_lookback_tests:
+            for sl in stop_loss_tests:
+                for rr in reward_risk_tests:
+                    for hold in max_hold_tests:
+                        try:
+                            result = simulate_combo(
+                                swing_lookback=int(swing),
+                                stop_loss_pips=float(sl),
+                                reward_risk=float(rr),
+                                max_hold_bars=int(hold)
+                            )
+
+                            if result.get("status") == "ok":
+                                results.append(result)
+                            else:
+                                error_results.append(result)
+
+                        except Exception as combo_error:
+                            error_results.append({
+                                "status": "error",
+                                "swing_lookback": swing,
+                                "stop_loss_pips": sl,
+                                "reward_risk": rr,
+                                "max_hold_bars": hold,
+                                "error": str(combo_error)
+                            })
+
+        ranked = sorted(
+            results,
+            key=lambda x: (
+                x.get("rank_score", -999),
+                x.get("total_r", -999),
+                x.get("profit_factor") or 0,
+                -x.get("max_losing_streak", 999)
+            ),
+            reverse=True
+        )
+
+        profitable = [
+            r for r in results
+            if r.get("trades_taken", 0) >= min_trades_required
+            and r.get("total_r", 0) > 0
+            and (r.get("profit_factor") or 0) > 1
+        ]
+
+        negative = [
+            r for r in results
+            if r.get("trades_taken", 0) >= min_trades_required
+            and r.get("total_r", 0) <= 0
+        ]
+
+        best = ranked[0] if ranked else None
+
+        verdict = "not_enough_data"
+
+        if best:
+            if best.get("trades_taken", 0) < min_trades_required:
+                verdict = "not_enough_trades_to_trust"
+            elif best.get("total_r", 0) > 0 and (best.get("profit_factor") or 0) > 1:
+                verdict = "sweep_reclaim_shows_potential_needs_validation"
+            else:
+                verdict = "sweep_reclaim_not_validated"
+
+        response = {
+            "status": "ok",
+            "engine_version": "quant_backtest_sweep_reclaim_v1",
+            "strategy_mode": "sweep_reclaim_v1",
+            "asset_class": asset_class,
+            "symbol": symbol.upper(),
+            "normalized_symbol": normalized_symbol,
+            "entry_timeframe": entry_timeframe.upper(),
+            "confirm_timeframe": confirm_timeframe.upper(),
+            "lookback_bars": lookback_bars,
+            "cached_data": {
+                "entry_fetch_once": True,
+                "confirm_fetch_once": True,
+                "entry_candles_used": len(entry_df),
+                "confirm_candles_used": len(confirm_df),
+                "entry_confirmed_candle_mode": {k: v for k, v in entry_confirmed_info.items() if k != "candles"},
+                "confirm_confirmed_candle_mode": {k: v for k, v in confirm_confirmed_info.items() if k != "candles"}
+            },
+            "sweep_space": {
+                "swing_lookback": swing_lookback_tests,
+                "stop_loss_pips": stop_loss_tests,
+                "reward_risk": reward_risk_tests,
+                "max_hold_bars": max_hold_tests,
+                "combinations_tested": len(results) + len(error_results),
+                "min_trades_required": min_trades_required
+            },
+            "shared_assumptions": {
+                "spread_pips": spread_pips,
+                "max_allowed_spread_pips": max_allowed_spread_pips,
+                "account_balance": account_balance,
+                "risk_percent": risk_percent,
+                "broker_min_lot_size": broker_min_lot_size,
+                "broker_lot_step": broker_lot_step,
+                "pip_size": pip_size,
+                "pip_value_per_standard_lot": pip_value_per_standard_lot
+            },
+            "gate_templates": {
+                "spread_filter": spread_filter_template
+            },
+            "verdict": verdict,
+            "best_result": best,
+            "top_10_results": ranked[:10],
+            "valid_result_count": len(results),
+            "profitable_result_count": len(profitable),
+            "negative_result_count": len(negative),
+            "error_result_count": len(error_results),
+            "error_samples": error_results[:10],
+            "integrity_note": "Sweep-reclaim backtest is diagnostic only. It does not prove future profitability.",
+            "next_upgrade": "If sweep-reclaim shows potential, add H1 regime filter and out-of-sample validation. If not, refine structure trigger."
+        }
+
+        return make_json_safe(response)
+
+    except Exception as e:
+        return make_json_safe({
+            "status": "error",
+            "engine_version": "quant_backtest_sweep_reclaim_v1",
+            "strategy_mode": "sweep_reclaim_v1",
+            "symbol": symbol,
+            "error": str(e),
+            "reason": "Sweep-reclaim backtest failed safely."
+        })
+
