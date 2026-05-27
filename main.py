@@ -783,3 +783,25 @@ def build_higher_timeframe_bias(df: pd.DataFrame, label: str = "M15"):
             "macd_bearish": bool(macd_bearish)
         }
     }
+
+@app.get("/quant/forex-decision-stack-v1")
+def quant_forex_decision_stack_v1_test(
+    asset_class: str = Query(default="forex"),
+    symbol: str = Query(default="EURUSD"),
+    entry_timeframe: str = Query(default="M5"),
+    confirm_timeframe: str = Query(default="M15"),
+    lookback_bars: int = Query(default=300, ge=220, le=5000),
+    timezone: Optional[str] = Query(default="Asia/Manila")
+):
+    return {
+        "status": "ok",
+        "engine_version": "quant_forex_decision_stack_v1_route_test",
+        "message": "Quant Forex Decision Stack route is registered successfully.",
+        "asset_class": asset_class,
+        "symbol": symbol,
+        "entry_timeframe": entry_timeframe,
+        "confirm_timeframe": confirm_timeframe,
+        "lookback_bars": lookback_bars,
+        "timezone": timezone,
+        "next_step": "Replace this test endpoint with the full M5 + M15 decision stack logic."
+    }
