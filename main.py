@@ -712,10 +712,9 @@ def market_snapshot_v1_1(
             final_action = "HOLD"
             hard_filters.append("Price is too close to EMA 200. Possible chop/compression. Forced HOLD.")
 
-        if confidence["score"] < 60:
-            if final_action in ["BUY", "SELL"]:
-                final_action = "HOLD"
-                hard_filters.append("Confidence score is below 60. Forced HOLD.")
+        if confidence.get("score", 0) < 60 and final_action in ["BUY", "SELL"]:
+            final_action = "HOLD"
+            hard_filters.append("Confidence score is below 60. Forced HOLD.")
 
         warnings = signal.get("warnings", [])
 
