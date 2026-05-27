@@ -1282,3 +1282,439 @@ def quant_forex_decision_stack_v1(
             "error": str(e),
             "reason": "Quant Forex Decision Stack v1 failed safely. Defaulting to HOLD."
         })
+
+
+@app.get("/quant/backtest-decision-stack-v1")
+def quant_backtest_decision_stack_v1(
+    asset_class: str = Query(default="forex"),
+    symbol: str = Query(default="EURUSD"),
+    entry_timeframe: str = Query(default="M5"),
+    confirm_timeframe: str = Query(default="M15"),
+    lookback_bars: int = Query(default=1000, ge=300, le=5000),
+    spread_pips: float = Query(default=0.8, ge=0),
+    max_allowed_spread_pips: float = Query(default=1.5, ge=0.1),
+    account_balance: float = Query(default=50.0, ge=1),
+    risk_percent: float = Query(default=1.0, ge=0.1, le=5.0),
+    stop_loss_pips: float = Query(default=20.0, ge=1),
+    reward_risk: float = Query(default=1.5, ge=0.5, le=5.0),
+    max_hold_bars: int = Query(default=12, ge=1, le=100),
+    pip_size: float = Query(default=0.0001, ge=0.00001),
+    pip_value_per_standard_lot: float = Query(default=10.0, ge=0.01),
+    broker_min_lot_size: float = Query(default=0.001, ge=0.0001),
+    broker_lot_step: float = Query(default=0.001, ge=0.0001)
+):
+    """
+    Backtest Decision Stack v1:
+    Tests the current M5 entry + M15 confirmation stack with spread and low-capital risk gate.
+    This is a rough validation engine, not proof of future profitability.
+    """
+    try:
+        normalized_symbol = normalize_symbol(symbol)
+        entry_interval = normalize_timeframe(entry_timeframe)
+        confirm_interval = normalize_timeframe(confirm_timeframe)
+
+        fetch_size = max(lookback_bars + 100, 400)
+
+        entry_raw = fetch_twelve_data_candles(
+            symbol=normalized_symbol,
+            interval=entry_interval,
+            outputsize=fetch_size
+        )
+
+        confirm_raw = fetch_twelve_data_candles(
+            symbol=normalized_symbol,
+            interval=confirm_interval,
+            outputsize=fetch_size
+        )
+
+        entry_confirmed_info = select_confirmed_candles(entry_raw, entry_timeframe)
+        confirm_confirmed_info = select_confirmed_candles(confirm_raw, confirm_timeframe)
+
+        entry_df = entry_confirmed_info["candles"].tail(lookback_bars).reset_index(drop=True)
+        confirm_df = confirm_confirmed_info["candles"].tail(lookback_bars).reset_index(drop=True)
+
+        if len(entry_df) < 250 or len(confirm_df) < 220:
+            return make_json_safe({
+                "status": "error",
+                "engine_version": "quant_backtest_decision_stack_v1",
+                "symbol": symbol,
+                "reason": "Not enough confirmed candles for backtest.",
+                "entry_candles": len(entry_df),
+                "confirm_candles": len(confirm_df),
+                "minimum_entry_required": 250,
+                "minimum_confirm_required": 220
+            })
+
+        entry_df = calculate_indicators(entry_df)
+        confirm_df = calculate_indicators(confirm_df)
+
+        spread_filter_template = evaluate_spread_filter(spread_pips, max_allowed_spread_pips)
+        risk_gate_template = evaluate_low_capital_risk_gate(
+            account_balance=account_balance,
+            risk_percent=risk_percent,
+            stop_loss_pips=stop_loss_pips,
+            pip_value_per_standard_lot=pip_value_per_standard_lot,
+            broker_min_lot_size=broker_min_lot_size,
+            broker_lot_step=broker_lot_step
+        )
+
+        trades = []
+        block_counts = {}
+        raw_signal_counts = {
+            "BUY": 0,
+            "SELL": 0,
+            "HOLD": 0
+        }
+
+        start_index = 220
+        end_index = len(entry_df) - max_hold_bars - 1
+
+        if end_index <= start_index:
+            return make_json_safe({
+                "status": "error",
+                "engine_version": "quant_backtest_decision_stack_v1",
+                "symbol": symbol,
+                "reason": "Not enough candles after indicator warmup and max_hold_bars.",
+                "entry_candles": len(entry_df),
+                "start_index": start_index,
+                "end_index": end_index
+            })
+
+        def add_block(reason: str):
+            block_counts[reason] = block_counts.get(reason, 0) + 1
+
+        for i in range(start_index, end_index):
+            entry_slice = entry_df.iloc[:i + 1].reset_index(drop=True)
+            signal = build_signal(entry_slice)
+
+            if signal is None:
+                signal = {
+                    "action": "HOLD",
+                    "reason": "Entry signal returned None.",
+                    "checks": {},
+                    "warnings": []
+                }
+
+            raw_action = signal.get("action", "HOLD")
+            raw_signal_counts[raw_action] = raw_signal_counts.get(raw_action, 0) + 1
+
+            if raw_action not in ["BUY", "SELL"]:
+                continue
+
+            current = entry_slice.iloc[-1]
+            decision_time = current["datetime"]
+
+            confirm_slice = confirm_df[confirm_df["datetime"] <= decision_time].reset_index(drop=True)
+
+            if len(confirm_slice) < 210:
+                add_block("Not enough M15 confirmation candles.")
+                continue
+
+            confirm_bias = build_higher_timeframe_bias(confirm_slice, label=confirm_timeframe.upper())
+
+            if confirm_bias is None:
+                confirm_bias = {
+                    "bias": "unknown",
+                    "reason": "Higher-timeframe confirmation returned None."
+                }
+
+            confidence = calculate_confidence_score(signal, current)
+
+            if confidence is None:
+                confidence = {
+                    "score": 0,
+                    "label": "weak_or_no_trade",
+                    "reasons": ["Confidence returned None."]
+                }
+
+            spread_filter = evaluate_spread_filter(spread_pips, max_allowed_spread_pips)
+
+            if spread_filter is None:
+                spread_filter = {
+                    "spread_status": "error",
+                    "trade_allowed": False,
+                    "reason": "Spread filter returned None."
+                }
+
+            risk_gate = evaluate_low_capital_risk_gate(
+                account_balance=account_balance,
+                risk_percent=risk_percent,
+                stop_loss_pips=stop_loss_pips,
+                pip_value_per_standard_lot=pip_value_per_standard_lot,
+                broker_min_lot_size=broker_min_lot_size,
+                broker_lot_step=broker_lot_step
+            )
+
+            if risk_gate is None:
+                risk_gate = {
+                    "risk_gate_status": "error",
+                    "risk_gate_passed": False,
+                    "reason": "Risk gate returned None."
+                }
+
+            close = current["close"]
+            ema_200 = current["ema_200"]
+            atr_14 = current["atr_14"]
+
+            ema_distance_atr = None
+            compression_zone = False
+
+            if atr_14 and atr_14 > 0:
+                ema_distance_atr = abs(close - ema_200) / atr_14
+                compression_zone = bool(ema_distance_atr <= 0.25)
+
+            if raw_action == "BUY" and confirm_bias.get("bias") != "bullish":
+                add_block("M15 confirmation blocked BUY.")
+                continue
+
+            if raw_action == "SELL" and confirm_bias.get("bias") != "bearish":
+                add_block("M15 confirmation blocked SELL.")
+                continue
+
+            if compression_zone:
+                add_block("Compression zone blocked trade.")
+                continue
+
+            if confidence.get("score", 0) < 60:
+                add_block("Confidence score below 60.")
+                continue
+
+            if not spread_filter.get("trade_allowed", True):
+                add_block("Spread filter blocked trade.")
+                continue
+
+            if not risk_gate.get("risk_gate_passed", True):
+                add_block("Risk gate blocked trade.")
+                continue
+
+            # Execute on next candle open to reduce lookahead bias.
+            execution_bar = entry_df.iloc[i + 1]
+            entry_price = execution_bar["open"]
+            entry_time = execution_bar["datetime"]
+
+            sl_distance = stop_loss_pips * pip_size
+            tp_distance = stop_loss_pips * reward_risk * pip_size
+
+            if raw_action == "BUY":
+                stop_price = entry_price - sl_distance
+                target_price = entry_price + tp_distance
+            else:
+                stop_price = entry_price + sl_distance
+                target_price = entry_price - tp_distance
+
+            outcome = "timeout"
+            r_result = 0.0
+            exit_price = None
+            exit_time = None
+
+            final_j = min(i + 1 + max_hold_bars, len(entry_df) - 1)
+
+            for j in range(i + 1, final_j + 1):
+                bar = entry_df.iloc[j]
+                high = bar["high"]
+                low = bar["low"]
+
+                if raw_action == "BUY":
+                    hit_stop = low <= stop_price
+                    hit_target = high >= target_price
+
+                    # Conservative assumption: if both hit in same candle, count loss.
+                    if hit_stop and hit_target:
+                        outcome = "loss"
+                        r_result = -1.0
+                        exit_price = stop_price
+                        exit_time = bar["datetime"]
+                        break
+
+                    if hit_stop:
+                        outcome = "loss"
+                        r_result = -1.0
+                        exit_price = stop_price
+                        exit_time = bar["datetime"]
+                        break
+
+                    if hit_target:
+                        outcome = "win"
+                        r_result = reward_risk
+                        exit_price = target_price
+                        exit_time = bar["datetime"]
+                        break
+
+                if raw_action == "SELL":
+                    hit_stop = high >= stop_price
+                    hit_target = low <= target_price
+
+                    # Conservative assumption: if both hit in same candle, count loss.
+                    if hit_stop and hit_target:
+                        outcome = "loss"
+                        r_result = -1.0
+                        exit_price = stop_price
+                        exit_time = bar["datetime"]
+                        break
+
+                    if hit_stop:
+                        outcome = "loss"
+                        r_result = -1.0
+                        exit_price = stop_price
+                        exit_time = bar["datetime"]
+                        break
+
+                    if hit_target:
+                        outcome = "win"
+                        r_result = reward_risk
+                        exit_price = target_price
+                        exit_time = bar["datetime"]
+                        break
+
+            if outcome == "timeout":
+                timeout_bar = entry_df.iloc[final_j]
+                exit_price = timeout_bar["close"]
+                exit_time = timeout_bar["datetime"]
+
+                if raw_action == "BUY":
+                    pnl_pips = (exit_price - entry_price) / pip_size
+                else:
+                    pnl_pips = (entry_price - exit_price) / pip_size
+
+                r_result = round(pnl_pips / stop_loss_pips, 3)
+
+                if r_result > 0:
+                    outcome = "timeout_win"
+                elif r_result < 0:
+                    outcome = "timeout_loss"
+                else:
+                    outcome = "breakeven"
+
+            session_context = classify_trading_session(pd.Timestamp(entry_time))
+
+            trades.append({
+                "decision_time": decision_time,
+                "entry_time": entry_time,
+                "exit_time": exit_time,
+                "action": raw_action,
+                "entry_price": round_float(entry_price, 5),
+                "exit_price": round_float(exit_price, 5),
+                "stop_price": round_float(stop_price, 5),
+                "target_price": round_float(target_price, 5),
+                "outcome": outcome,
+                "r_result": round(r_result, 3),
+                "confidence_score": confidence.get("score", 0),
+                "m15_bias": confirm_bias.get("bias"),
+                "session_context": session_context,
+                "spread_status": spread_filter.get("spread_status"),
+                "risk_gate_status": risk_gate.get("risk_gate_status"),
+                "rounded_lot_size": risk_gate.get("rounded_lot_size")
+            })
+
+        total_trades = len(trades)
+        wins = [t for t in trades if t["r_result"] > 0]
+        losses = [t for t in trades if t["r_result"] < 0]
+        breakeven = [t for t in trades if t["r_result"] == 0]
+
+        gross_win_r = sum(t["r_result"] for t in wins)
+        gross_loss_r = abs(sum(t["r_result"] for t in losses))
+
+        win_rate = (len(wins) / total_trades) * 100 if total_trades > 0 else 0
+        avg_r = (sum(t["r_result"] for t in trades) / total_trades) if total_trades > 0 else 0
+        total_r = sum(t["r_result"] for t in trades)
+        profit_factor = (gross_win_r / gross_loss_r) if gross_loss_r > 0 else None
+
+        max_losing_streak = 0
+        current_losing_streak = 0
+
+        for t in trades:
+            if t["r_result"] < 0:
+                current_losing_streak += 1
+                max_losing_streak = max(max_losing_streak, current_losing_streak)
+            else:
+                current_losing_streak = 0
+
+        session_breakdown = {}
+
+        for t in trades:
+            for session in t.get("session_context", []):
+                if session not in session_breakdown:
+                    session_breakdown[session] = {
+                        "trades": 0,
+                        "wins": 0,
+                        "losses": 0,
+                        "total_r": 0.0
+                    }
+
+                session_breakdown[session]["trades"] += 1
+                session_breakdown[session]["total_r"] += t["r_result"]
+
+                if t["r_result"] > 0:
+                    session_breakdown[session]["wins"] += 1
+                elif t["r_result"] < 0:
+                    session_breakdown[session]["losses"] += 1
+
+        for session, stats in session_breakdown.items():
+            trades_count = stats["trades"]
+            stats["win_rate"] = round((stats["wins"] / trades_count) * 100, 2) if trades_count else 0
+            stats["avg_r"] = round(stats["total_r"] / trades_count, 3) if trades_count else 0
+            stats["total_r"] = round(stats["total_r"], 3)
+
+        response = {
+            "status": "ok",
+            "provider": "Twelve Data",
+            "engine_version": "quant_backtest_decision_stack_v1",
+            "asset_class": asset_class,
+            "symbol": symbol.upper(),
+            "normalized_symbol": normalized_symbol,
+            "entry_timeframe": entry_timeframe.upper(),
+            "confirm_timeframe": confirm_timeframe.upper(),
+            "lookback_bars": lookback_bars,
+            "entry_candles_used": len(entry_df),
+            "confirm_candles_used": len(confirm_df),
+            "backtest_assumptions": {
+                "execution": "next_candle_open_after_confirmed_signal",
+                "confirmed_candle_mode": True,
+                "same_candle_tp_sl_conflict": "counted_as_loss_conservative",
+                "spread_pips": spread_pips,
+                "max_allowed_spread_pips": max_allowed_spread_pips,
+                "stop_loss_pips": stop_loss_pips,
+                "reward_risk": reward_risk,
+                "max_hold_bars": max_hold_bars,
+                "account_balance": account_balance,
+                "risk_percent": risk_percent,
+                "broker_min_lot_size": broker_min_lot_size,
+                "broker_lot_step": broker_lot_step
+            },
+            "gate_templates": {
+                "spread_filter": spread_filter_template,
+                "risk_gate": risk_gate_template
+            },
+            "raw_signal_counts": raw_signal_counts,
+            "block_counts": block_counts,
+            "performance": {
+                "trades_taken": total_trades,
+                "wins": len(wins),
+                "losses": len(losses),
+                "breakeven": len(breakeven),
+                "win_rate_percent": round(win_rate, 2),
+                "total_r": round(total_r, 3),
+                "average_r": round(avg_r, 3),
+                "profit_factor": round(profit_factor, 3) if profit_factor is not None else None,
+                "max_losing_streak": max_losing_streak
+            },
+            "session_breakdown": session_breakdown,
+            "recent_trades_sample": trades[-10:],
+            "integrity_note": "Backtest is an approximation for research only. It is not financial advice and does not guarantee future results.",
+            "next_upgrade": "Add H1 regime filter and walk-forward validation."
+        }
+
+        return make_json_safe(response)
+
+    except Exception as e:
+        return make_json_safe({
+            "status": "error",
+            "provider": "Twelve Data",
+            "engine_version": "quant_backtest_decision_stack_v1",
+            "symbol": symbol,
+            "entry_timeframe": entry_timeframe,
+            "confirm_timeframe": confirm_timeframe,
+            "error": str(e),
+            "reason": "Backtest failed safely."
+        })
+
