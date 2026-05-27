@@ -231,7 +231,7 @@ def check_candle_freshness(latest_dt: pd.Timestamp, timeframe: str):
         "now_utc": str(now_utc),
         "age_minutes": round(age_minutes, 2),
         "max_allowed_age_minutes": max_allowed_age,
-        "is_fresh": age_minutes <= max_allowed_age
+        "is_fresh": bool(age_minutes <= max_allowed_age)
     }
 
 
@@ -583,7 +583,7 @@ def market_snapshot_v1_1(
 
         compression_zone = False
         if ema_distance_atr is not None:
-            compression_zone = ema_distance_atr <= 0.25
+        compression_zone = bool(ema_distance_atr <= 0.25)
 
         final_action = signal.get("action")
         final_reason = signal.get("reason")
