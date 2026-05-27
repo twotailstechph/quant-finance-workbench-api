@@ -785,7 +785,7 @@ def build_higher_timeframe_bias(df: pd.DataFrame, label: str = "M15"):
     }
 
 @app.get("/quant/forex-decision-stack-v1")
-def quant_forex_decision_stack_v1_test(
+def quant_forex_decision_stack_v1(
     asset_class: str = Query(default="forex"),
     symbol: str = Query(default="EURUSD"),
     entry_timeframe: str = Query(default="M5"),
@@ -793,15 +793,162 @@ def quant_forex_decision_stack_v1_test(
     lookback_bars: int = Query(default=300, ge=220, le=5000),
     timezone: Optional[str] = Query(default="Asia/Manila")
 ):
-    return {
-        "status": "ok",
-        "engine_version": "quant_forex_decision_stack_v1_route_test",
-        "message": "Quant Forex Decision Stack route is registered successfully.",
-        "asset_class": asset_class,
-        "symbol": symbol,
-        "entry_timeframe": entry_timeframe,
-        "confirm_timeframe": confirm_timeframe,
-        "lookback_bars": lookback_bars,
-        "timezone": timezone,
-        "next_step": "Replace this test endpoint with the full M5 + M15 decision stack logic."
-    }
+    """
+    Quant Forex Decision Stack v1:
+    M5 entry signal + M15 trend confirmation + freshness/compression/confidence filters.
+    """
+    try:
+        normalized_symbol = normalize_symbol(symbol)
+
+        entry_interval = normalize_timeframe(entry_timeframe)
+        confirm_interval = normalize_timeframe(confirm_timeframe)
+
+        fetch_size = max(lookback_bars, 300)
+
+        entry_candles = fetch_twelve_data_candles(
+            symbol=normalized_symbol,
+            interval=entry_interval,
+            outputsize=fetch_size
+        )
+
+        confirm_candles = fetch_twelve_data_candles(
+            symbol=normalized_symbol,
+            interval=confirm_interval,
+            outputsize=fetch_size
+        )
+
+        if len(entry_candles) < 220 or len(confirm_candles) < 220:
+            return make_json_safe({
+                "status": "error",
+                "engine_version": "quant_forex_decision_stack_v1",
+                "symbol": symbol,
+                "final_action": "HOLD",
+                "reason": "Not enough candle data returned for entry or confirmation timeframe.",
+                "entry_candles_returned": len(entry_candles),
+                "confirm_candles_returned": len(confirm_candles),
+                "minimum_required": 220
+            })
+
+        entry_candles = entry_candles.tail(lookback_bars).reset_index(drop=True)
+        confirm_candles = confirm_candles.tail(lookback_bars).reset_index(drop=True)
+
+        entry_candles = calculate_indicators(entry_candles)
+        confirm_candles = calculate_indicators(confirm_candles)
+
+        entry_signal = build_signal(entry_candles)
+        confirm_bias = build_higher_timeframe_bias(confirm_candles, label=confirm_timeframe.upper())
+
+        latest_entry = entry_candles.iloc[-1]
+        previous_entry = entry_candles.iloc[-2]
+
+        freshness = check_candle_freshness(latest_entry["datetime"], entry_timeframe)
+        sessions = classify_trading_session(latest_entry["datetime"])
+        confidence = calculate_confidence_score(entry_signal, latest_entry)
+
+        close = latest_entry["close"]
+        ema_200 = latest_entry["ema_200"]
+        atr_14 = latest_entry["atr_14"]
+
+        ema_distance = abs(close - ema_200)
+        ema_distance_atr = ema_distance / atr_14 if atr_14 and atr_14 > 0 else None
+
+        compression_zone = False
+        if ema_distance_atr is not None:
+            compression_zone = bool(ema_distance_atr <= 0.25)
+
+        raw_action = entry_signal.get("action", "HOLD")
+        final_action = raw_action
+        final_reason = entry_signal.get("reason", "No valid entry reason returned.")
+        hard_filters = []
+
+        if raw_action == "BUY" and confirm_bias.get("bias") != "bullish":
+            final_action = "HOLD"
+            hard_filters.append("M15 confirmation does not support BUY. Forced HOLD.")
+
+        if raw_action == "SELL" and confirm_bias.get("bias") != "bearish":
+            final_action = "HOLD"
+            hard_filters.append("M15 confirmation does not support SELL. Forced HOLD.")
+
+        if not freshness.get("is_fresh", False):
+            final_action = "HOLD"
+            hard_filters.append("Latest M5 candle appears stale. Forced HOLD.")
+
+        if compression_zone:
+            final_action = "HOLD"
+            hard_filters.append("Price is too close to M5 EMA 200. Possible chop/compression. Forced HOLD.")
+
+        if confidence.get("score", 0) < 60 and final_action in ["BUY", "SELL"]:
+            final_action = "HOLD"
+            hard_filters.append("Confidence score is below 60. Forced HOLD.")
+
+        warnings = entry_signal.get("warnings", [])
+
+        if hard_filters:
+            warnings = warnings + hard_filters
+            final_reason = "One or more decision-stack filters blocked the trade."
+
+        response = {
+            "status": "ok",
+            "provider": "Twelve Data",
+            "engine_version": "quant_forex_decision_stack_v1",
+            "asset_class": asset_class,
+            "symbol": symbol.upper(),
+            "normalized_symbol": normalized_symbol,
+            "entry_timeframe": entry_timeframe.upper(),
+            "confirm_timeframe": confirm_timeframe.upper(),
+            "entry_provider_interval": entry_interval,
+            "confirm_provider_interval": confirm_interval,
+            "lookback_bars": lookback_bars,
+            "entry_candles_used": len(entry_candles),
+            "confirm_candles_used": len(confirm_candles),
+            "latest_entry_candle_time": latest_entry["datetime"],
+            "previous_entry_candle_time": previous_entry["datetime"],
+            "session_context": sessions,
+            "freshness": freshness,
+            "entry_snapshot": {
+                "open": round_float(latest_entry["open"]),
+                "high": round_float(latest_entry["high"]),
+                "low": round_float(latest_entry["low"]),
+                "close": round_float(latest_entry["close"]),
+                "ema_200": round_float(latest_entry["ema_200"]),
+                "ema_distance": round_float(ema_distance, 7),
+                "ema_distance_atr": round_float(ema_distance_atr, 3) if ema_distance_atr is not None else None,
+                "macd_line": round_float(latest_entry["macd_line"], 7),
+                "macd_signal": round_float(latest_entry["macd_signal"], 7),
+                "macd_histogram": round_float(latest_entry["macd_histogram"], 7),
+                "rsi_14": round_float(latest_entry["rsi_14"], 2),
+                "atr_14": round_float(latest_entry["atr_14"], 7)
+            },
+            "entry_signal": {
+                "trend_state": entry_signal.get("trend_state"),
+                "macd_state": entry_signal.get("macd_state"),
+                "rsi_state": entry_signal.get("rsi_state"),
+                "checks": entry_signal.get("checks"),
+                "raw_action": raw_action,
+                "reason": entry_signal.get("reason")
+            },
+            "higher_timeframe_confirmation": confirm_bias,
+            "compression_zone": compression_zone,
+            "confidence": confidence,
+            "final_action": final_action,
+            "final_reason": final_reason,
+            "hard_filters": hard_filters,
+            "warnings": warnings,
+            "integrity_note": "Analytical signal only. Not financial advice. No live execution permission.",
+            "next_upgrade": "Add spread filter, news filter, and backtest validation."
+        }
+
+        return make_json_safe(response)
+
+    except Exception as e:
+        return make_json_safe({
+            "status": "error",
+            "provider": "Twelve Data",
+            "engine_version": "quant_forex_decision_stack_v1",
+            "symbol": symbol,
+            "entry_timeframe": entry_timeframe,
+            "confirm_timeframe": confirm_timeframe,
+            "final_action": "HOLD",
+            "error": str(e),
+            "reason": "Quant Forex Decision Stack v1 failed safely. Defaulting to HOLD."
+        })
