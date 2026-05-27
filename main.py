@@ -646,7 +646,7 @@ def market_snapshot_v1_1(
             "trend_state": signal.get("trend_state"),
             "macd_state": signal.get("macd_state"),
             "rsi_state": signal.get("rsi_state"),
-            "compression_zone": compression_zone,
+            "compression_zone": bool(compression_zone),
             "raw_signal_action": signal.get("action"),
             "final_action": final_action,
             "reason": final_reason,
