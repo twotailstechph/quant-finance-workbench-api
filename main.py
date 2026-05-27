@@ -1078,6 +1078,13 @@ def quant_forex_decision_stack_v1(
             broker_lot_step=broker_lot_step
         )
 
+        if risk_gate is None:
+            risk_gate = {
+                "risk_gate_status": "error",
+                "risk_gate_passed": False,
+                "reason": "Risk gate returned None. Forced HOLD."
+            }
+
         if raw_action == "BUY" and confirm_bias.get("bias") != "bullish":
             final_action = "HOLD"
             hard_filters.append("M15 confirmation does not support BUY. Forced HOLD.")
