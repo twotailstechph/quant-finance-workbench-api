@@ -329,6 +329,94 @@ def evaluate_spread_filter(current_spread_pips: Optional[float], max_allowed_spr
             "max_allowed_spread_pips": max_allowed_spread_pips,
             "reason": "Spread not provided. Not blocking in research mode, but live execution should require broker spread."
         }
+        
+def evaluate_low_capital_risk_gate(
+    account_balance: Optional[float],
+    risk_percent: float = 1.0,
+    stop_loss_pips: Optional[float] = None,
+    pip_value_per_standard_lot: float = 10.0,
+    broker_min_lot_size: float = 0.01,
+    broker_lot_step: float = 0.01
+):
+    """
+    Low-capital risk / lot-size gate.
+    Forces HOLD when safe position sizing is impossible.
+    """
+    if account_balance is None:
+        return {
+            "risk_gate_status": "unavailable",
+            "risk_gate_passed": True,
+            "reason": "Account balance not provided. Not blocking in research mode, but live mode should require account balance.",
+            "account_balance": None,
+            "risk_percent": risk_percent,
+            "stop_loss_pips": stop_loss_pips
+        }
+
+    if stop_loss_pips is None or stop_loss_pips <= 0:
+        return {
+            "risk_gate_status": "missing_stop_loss",
+            "risk_gate_passed": False,
+            "reason": "Stop-loss pips not provided or invalid. Cannot calculate safe lot size. Forced HOLD.",
+            "account_balance": account_balance,
+            "risk_percent": risk_percent,
+            "stop_loss_pips": stop_loss_pips
+        }
+
+    balance = float(account_balance)
+    risk_pct = float(risk_percent)
+    sl_pips = float(stop_loss_pips)
+    pip_value = float(pip_value_per_standard_lot)
+    min_lot = float(broker_min_lot_size)
+    lot_step = float(broker_lot_step)
+
+    max_risk_amount = balance * (risk_pct / 100.0)
+
+    raw_lot_size = max_risk_amount / (sl_pips * pip_value)
+
+    # Round down to broker lot step
+    rounded_lot_size = int(raw_lot_size / lot_step) * lot_step
+    rounded_lot_size = round(rounded_lot_size, 4)
+
+    min_lot_risk_amount = sl_pips * pip_value * min_lot
+    min_lot_actual_risk_percent = (min_lot_risk_amount / balance) * 100 if balance > 0 else None
+
+    if rounded_lot_size < min_lot:
+        return {
+            "risk_gate_status": "blocked_min_lot_too_large",
+            "risk_gate_passed": False,
+            "reason": "Broker minimum lot size would exceed allowed risk. Forced HOLD.",
+            "account_balance": balance,
+            "risk_percent": risk_pct,
+            "max_risk_amount": round(max_risk_amount, 2),
+            "stop_loss_pips": sl_pips,
+            "pip_value_per_standard_lot": pip_value,
+            "raw_lot_size": round(raw_lot_size, 5),
+            "rounded_lot_size": rounded_lot_size,
+            "broker_min_lot_size": min_lot,
+            "broker_lot_step": lot_step,
+            "min_lot_risk_amount": round(min_lot_risk_amount, 2),
+            "min_lot_actual_risk_percent": round(min_lot_actual_risk_percent, 2) if min_lot_actual_risk_percent is not None else None
+        }
+
+    actual_risk_amount = sl_pips * pip_value * rounded_lot_size
+    actual_risk_percent = (actual_risk_amount / balance) * 100 if balance > 0 else None
+
+    return {
+        "risk_gate_status": "passed",
+        "risk_gate_passed": True,
+        "reason": "Safe position size is possible within risk settings.",
+        "account_balance": balance,
+        "risk_percent": risk_pct,
+        "max_risk_amount": round(max_risk_amount, 2),
+        "stop_loss_pips": sl_pips,
+        "pip_value_per_standard_lot": pip_value,
+        "raw_lot_size": round(raw_lot_size, 5),
+        "rounded_lot_size": rounded_lot_size,
+        "broker_min_lot_size": min_lot,
+        "broker_lot_step": lot_step,
+        "actual_risk_amount": round(actual_risk_amount, 2),
+        "actual_risk_percent": round(actual_risk_percent, 2) if actual_risk_percent is not None else None
+    }
 
     spread_value = float(current_spread_pips)
     max_spread = float(max_allowed_spread_pips)
@@ -868,7 +956,13 @@ def quant_forex_decision_stack_v1(
     lookback_bars: int = Query(default=300, ge=220, le=5000),
     timezone: Optional[str] = Query(default="Asia/Manila"),
     current_spread_pips: Optional[float] = Query(default=None, ge=0),
-    max_allowed_spread_pips: float = Query(default=1.5, ge=0.1)
+    max_allowed_spread_pips: float = Query(default=1.5, ge=0.1),
+    account_balance: Optional[float] = Query(default=None, ge=0),
+    risk_percent: float = Query(default=1.0, ge=0.1, le=5.0),
+    stop_loss_pips: Optional[float] = Query(default=None, ge=0.1),
+    pip_value_per_standard_lot: float = Query(default=10.0, ge=0.01),
+    broker_min_lot_size: float = Query(default=0.01, ge=0.0001),
+    broker_lot_step: float = Query(default=0.01, ge=0.0001)
 ):
     """
     Quant Forex Decision Stack v1:
@@ -959,6 +1053,14 @@ def quant_forex_decision_stack_v1(
         hard_filters = []
         
         spread_filter = evaluate_spread_filter(current_spread_pips, max_allowed_spread_pips)
+            risk_gate = evaluate_low_capital_risk_gate(
+            account_balance=account_balance,
+            risk_percent=risk_percent,
+            stop_loss_pips=stop_loss_pips,
+            pip_value_per_standard_lot=pip_value_per_standard_lot,
+            broker_min_lot_size=broker_min_lot_size,
+            broker_lot_step=broker_lot_step
+        )
 
         if raw_action == "BUY" and confirm_bias.get("bias") != "bullish":
             final_action = "HOLD"
@@ -983,6 +1085,10 @@ def quant_forex_decision_stack_v1(
         if not spread_filter.get("trade_allowed", True):
             final_action = "HOLD"
             hard_filters.append("Spread is above allowed threshold. Forced HOLD.")
+
+        if not risk_gate.get("risk_gate_passed", True):
+            final_action = "HOLD"
+            hard_filters.append("Low-capital risk gate failed. Safe position sizing is impossible. Forced HOLD.")
         
         warnings = entry_signal.get("warnings", [])
 
@@ -1039,6 +1145,7 @@ def quant_forex_decision_stack_v1(
             "compression_zone": compression_zone,
             "confidence": confidence,
             "spread_filter": spread_filter,
+            "risk_gate": risk_gate,
             "final_action": final_action,
             "final_reason": final_reason,
             "hard_filters": hard_filters,
