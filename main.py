@@ -878,24 +878,24 @@ def quant_forex_decision_stack_v1(
         confirm_confirmed_candles = confirm_confirmed_info["candles"]
 
         if len(entry_confirmed_candles) < 220 or len(confirm_confirmed_candles) < 220:
-         return make_json_safe({
-        "status": "error",
-        "engine_version": "quant_forex_decision_stack_v1",
-        "symbol": symbol,
-        "final_action": "HOLD",
-        "reason": "Not enough confirmed candle data after removing forming candles.",
-        "entry_confirmed_candles": len(entry_confirmed_candles),
-        "confirm_confirmed_candles": len(confirm_confirmed_candles),
-        "minimum_required": 220,
-        "entry_confirmed_candle_mode": {k: v for k, v in entry_confirmed_info.items() if k != "candles"},
-        "confirm_confirmed_candle_mode": {k: v for k, v in confirm_confirmed_info.items() if k != "candles"}
-    })
+             return make_json_safe({
+                "status": "error",
+                "engine_version": "quant_forex_decision_stack_v1",
+                "symbol": symbol,
+                "final_action": "HOLD",
+                "reason": "Not enough confirmed candle data after removing forming candles.",
+                "entry_confirmed_candles": len(entry_confirmed_candles),
+                "confirm_confirmed_candles": len(confirm_confirmed_candles),
+                "minimum_required": 220,
+                "entry_confirmed_candle_mode": {k: v for k, v in entry_confirmed_info.items() if k != "candles"},
+                "confirm_confirmed_candle_mode": {k: v for k, v in confirm_confirmed_info.items() if k != "candles"}
+            })
 
-entry_candles = entry_confirmed_candles.tail(lookback_bars).reset_index(drop=True)
-confirm_candles = confirm_confirmed_candles.tail(lookback_bars).reset_index(drop=True)
+        entry_candles = entry_confirmed_candles.tail(lookback_bars).reset_index(drop=True)
+        confirm_candles = confirm_confirmed_candles.tail(lookback_bars).reset_index(drop=True)
 
-entry_candles = calculate_indicators(entry_candles)
-confirm_candles = calculate_indicators(confirm_candles)
+        entry_candles = calculate_indicators(entry_candles)
+        confirm_candles = calculate_indicators(confirm_candles)
 
         entry_signal = build_signal(entry_candles)
         confirm_bias = build_higher_timeframe_bias(confirm_candles, label=confirm_timeframe.upper())
