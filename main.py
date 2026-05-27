@@ -340,51 +340,95 @@ def evaluate_low_capital_risk_gate(
 ):
     """
     Low-capital risk / lot-size gate.
+    Always returns a dictionary.
     Forces HOLD when safe position sizing is impossible.
     """
-    if account_balance is None:
+    try:
+        if account_balance is None:
+            return {
+                "risk_gate_status": "unavailable",
+                "risk_gate_passed": True,
+                "reason": "Account balance not provided. Not blocking in research mode, but live mode should require account balance.",
+                "account_balance": None,
+                "risk_percent": risk_percent,
+                "stop_loss_pips": stop_loss_pips
+            }
+
+        balance = float(account_balance)
+        risk_pct = float(risk_percent)
+
+        if balance <= 0:
+            return {
+                "risk_gate_status": "invalid_account_balance",
+                "risk_gate_passed": False,
+                "reason": "Account balance must be greater than zero. Forced HOLD.",
+                "account_balance": balance,
+                "risk_percent": risk_pct,
+                "stop_loss_pips": stop_loss_pips
+            }
+
+        if stop_loss_pips is None or float(stop_loss_pips) <= 0:
+            return {
+                "risk_gate_status": "missing_stop_loss",
+                "risk_gate_passed": False,
+                "reason": "Stop-loss pips not provided or invalid. Cannot calculate safe lot size. Forced HOLD.",
+                "account_balance": balance,
+                "risk_percent": risk_pct,
+                "stop_loss_pips": stop_loss_pips
+            }
+
+        sl_pips = float(stop_loss_pips)
+        pip_value = float(pip_value_per_standard_lot)
+        min_lot = float(broker_min_lot_size)
+        lot_step = float(broker_lot_step)
+
+        if pip_value <= 0 or min_lot <= 0 or lot_step <= 0:
+            return {
+                "risk_gate_status": "invalid_broker_settings",
+                "risk_gate_passed": False,
+                "reason": "Pip value, broker minimum lot size, and lot step must be greater than zero. Forced HOLD.",
+                "account_balance": balance,
+                "risk_percent": risk_pct,
+                "stop_loss_pips": sl_pips,
+                "pip_value_per_standard_lot": pip_value,
+                "broker_min_lot_size": min_lot,
+                "broker_lot_step": lot_step
+            }
+
+        max_risk_amount = balance * (risk_pct / 100.0)
+        raw_lot_size = max_risk_amount / (sl_pips * pip_value)
+
+        rounded_lot_size = int(raw_lot_size / lot_step) * lot_step
+        rounded_lot_size = round(rounded_lot_size, 5)
+
+        min_lot_risk_amount = sl_pips * pip_value * min_lot
+        min_lot_actual_risk_percent = (min_lot_risk_amount / balance) * 100.0
+
+        if rounded_lot_size < min_lot:
+            return {
+                "risk_gate_status": "blocked_min_lot_too_large",
+                "risk_gate_passed": False,
+                "reason": "Broker minimum lot size would exceed allowed risk. Forced HOLD.",
+                "account_balance": balance,
+                "risk_percent": risk_pct,
+                "max_risk_amount": round(max_risk_amount, 2),
+                "stop_loss_pips": sl_pips,
+                "pip_value_per_standard_lot": pip_value,
+                "raw_lot_size": round(raw_lot_size, 5),
+                "rounded_lot_size": rounded_lot_size,
+                "broker_min_lot_size": min_lot,
+                "broker_lot_step": lot_step,
+                "min_lot_risk_amount": round(min_lot_risk_amount, 2),
+                "min_lot_actual_risk_percent": round(min_lot_actual_risk_percent, 2)
+            }
+
+        actual_risk_amount = sl_pips * pip_value * rounded_lot_size
+        actual_risk_percent = (actual_risk_amount / balance) * 100.0
+
         return {
-            "risk_gate_status": "unavailable",
+            "risk_gate_status": "passed",
             "risk_gate_passed": True,
-            "reason": "Account balance not provided. Not blocking in research mode, but live mode should require account balance.",
-            "account_balance": None,
-            "risk_percent": risk_percent,
-            "stop_loss_pips": stop_loss_pips
-        }
-
-    if stop_loss_pips is None or stop_loss_pips <= 0:
-        return {
-            "risk_gate_status": "missing_stop_loss",
-            "risk_gate_passed": False,
-            "reason": "Stop-loss pips not provided or invalid. Cannot calculate safe lot size. Forced HOLD.",
-            "account_balance": account_balance,
-            "risk_percent": risk_percent,
-            "stop_loss_pips": stop_loss_pips
-        }
-
-    balance = float(account_balance)
-    risk_pct = float(risk_percent)
-    sl_pips = float(stop_loss_pips)
-    pip_value = float(pip_value_per_standard_lot)
-    min_lot = float(broker_min_lot_size)
-    lot_step = float(broker_lot_step)
-
-    max_risk_amount = balance * (risk_pct / 100.0)
-
-    raw_lot_size = max_risk_amount / (sl_pips * pip_value)
-
-    # Round down to broker lot step
-    rounded_lot_size = int(raw_lot_size / lot_step) * lot_step
-    rounded_lot_size = round(rounded_lot_size, 4)
-
-    min_lot_risk_amount = sl_pips * pip_value * min_lot
-    min_lot_actual_risk_percent = (min_lot_risk_amount / balance) * 100 if balance > 0 else None
-
-    if rounded_lot_size < min_lot:
-        return {
-            "risk_gate_status": "blocked_min_lot_too_large",
-            "risk_gate_passed": False,
-            "reason": "Broker minimum lot size would exceed allowed risk. Forced HOLD.",
+            "reason": "Safe position size is possible within risk settings.",
             "account_balance": balance,
             "risk_percent": risk_pct,
             "max_risk_amount": round(max_risk_amount, 2),
@@ -394,49 +438,21 @@ def evaluate_low_capital_risk_gate(
             "rounded_lot_size": rounded_lot_size,
             "broker_min_lot_size": min_lot,
             "broker_lot_step": lot_step,
-            "min_lot_risk_amount": round(min_lot_risk_amount, 2),
-            "min_lot_actual_risk_percent": round(min_lot_actual_risk_percent, 2) if min_lot_actual_risk_percent is not None else None
+            "actual_risk_amount": round(actual_risk_amount, 2),
+            "actual_risk_percent": round(actual_risk_percent, 2)
         }
 
-    actual_risk_amount = sl_pips * pip_value * rounded_lot_size
-    actual_risk_percent = (actual_risk_amount / balance) * 100 if balance > 0 else None
-
-    return {
-        "risk_gate_status": "passed",
-        "risk_gate_passed": True,
-        "reason": "Safe position size is possible within risk settings.",
-        "account_balance": balance,
-        "risk_percent": risk_pct,
-        "max_risk_amount": round(max_risk_amount, 2),
-        "stop_loss_pips": sl_pips,
-        "pip_value_per_standard_lot": pip_value,
-        "raw_lot_size": round(raw_lot_size, 5),
-        "rounded_lot_size": rounded_lot_size,
-        "broker_min_lot_size": min_lot,
-        "broker_lot_step": lot_step,
-        "actual_risk_amount": round(actual_risk_amount, 2),
-        "actual_risk_percent": round(actual_risk_percent, 2) if actual_risk_percent is not None else None
-    }
-
-    spread_value = float(current_spread_pips)
-    max_spread = float(max_allowed_spread_pips)
-
-    if spread_value <= max_spread:
+    except Exception as e:
         return {
-            "spread_status": "normal",
-            "trade_allowed": True,
-            "current_spread_pips": spread_value,
-            "max_allowed_spread_pips": max_spread,
-            "reason": "Spread is within allowed threshold."
+            "risk_gate_status": "error",
+            "risk_gate_passed": False,
+            "reason": "Risk gate calculation failed. Forced HOLD.",
+            "error": str(e),
+            "account_balance": account_balance,
+            "risk_percent": risk_percent,
+            "stop_loss_pips": stop_loss_pips
         }
 
-    return {
-        "spread_status": "elevated",
-        "trade_allowed": False,
-        "current_spread_pips": spread_value,
-        "max_allowed_spread_pips": max_spread,
-        "reason": "Spread is above allowed threshold. Trade should be blocked."
-    }
 
 def calculate_confidence_score(signal: dict, latest: pd.Series):
     """
