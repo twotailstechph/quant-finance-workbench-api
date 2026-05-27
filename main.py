@@ -5056,3 +5056,574 @@ def quant_backtest_sweep_reclaim_side_diagnostics_v1(
             "reason": "Side diagnostics failed safely."
         })
 
+
+@app.get("/quant/backtest-sweep-reclaim-buyonly-gauntlet-v1")
+def quant_backtest_sweep_reclaim_buyonly_gauntlet_v1(
+    asset_class: str = Query(default="forex"),
+    symbol: str = Query(default="EURUSD"),
+    entry_timeframe: str = Query(default="M5"),
+    confirm_timeframe: str = Query(default="M15"),
+    lookback_bars: int = Query(default=3000, ge=1000, le=5000),
+    account_balance: float = Query(default=50.0, ge=1),
+    risk_percent: float = Query(default=1.0, ge=0.1, le=5.0),
+    pip_size: float = Query(default=0.0001, ge=0.00001),
+    pip_value_per_standard_lot: float = Query(default=10.0, ge=0.01),
+    broker_min_lot_size: float = Query(default=0.001, ge=0.0001),
+    broker_lot_step: float = Query(default=0.001, ge=0.0001),
+    walkforward_windows: int = Query(default=5, ge=3, le=10),
+    min_total_trades_required: int = Query(default=20, ge=5, le=300),
+    min_positive_windows_required: int = Query(default=3, ge=1, le=10),
+    baseline_pf_required: float = Query(default=1.3, ge=1.0, le=5.0),
+    moderate_pf_required: float = Query(default=1.15, ge=1.0, le=5.0),
+    max_losing_streak_baseline: int = Query(default=3, ge=1, le=20),
+    max_losing_streak_moderate: int = Query(default=4, ge=1, le=20)
+):
+    """
+    BUY-only Sweep-Reclaim Gauntlet v1.
+    This is a stricter validation endpoint before paper trading.
+    It tests BUY-only sweep-reclaim across session filters, cooldown, stops, and cost stress.
+    """
+    try:
+        normalized_symbol = normalize_symbol(symbol)
+        entry_interval = normalize_timeframe(entry_timeframe)
+        confirm_interval = normalize_timeframe(confirm_timeframe)
+
+        fetch_size = max(lookback_bars + 100, 1200)
+
+        entry_raw = fetch_twelve_data_candles(
+            symbol=normalized_symbol,
+            interval=entry_interval,
+            outputsize=fetch_size
+        )
+
+        confirm_raw = fetch_twelve_data_candles(
+            symbol=normalized_symbol,
+            interval=confirm_interval,
+            outputsize=fetch_size
+        )
+
+        entry_confirmed_info = select_confirmed_candles(entry_raw, entry_timeframe)
+        confirm_confirmed_info = select_confirmed_candles(confirm_raw, confirm_timeframe)
+
+        entry_df = entry_confirmed_info["candles"].tail(lookback_bars).reset_index(drop=True)
+        confirm_df = confirm_confirmed_info["candles"].tail(lookback_bars).reset_index(drop=True)
+
+        if len(entry_df) < 500 or len(confirm_df) < 220:
+            return make_json_safe({
+                "status": "error",
+                "engine_version": "quant_backtest_sweep_reclaim_buyonly_gauntlet_v1",
+                "reason": "Not enough candles for BUY-only gauntlet.",
+                "entry_candles": len(entry_df),
+                "confirm_candles": len(confirm_df)
+            })
+
+        entry_df = calculate_indicators(entry_df)
+        confirm_df = calculate_indicators(confirm_df)
+
+        # Candidate search space, intentionally narrow to avoid overfitting.
+        candidate_tests = []
+        for stop_loss_pips in [8.0, 10.0]:
+            for reward_risk in [1.0]:
+                for max_hold_bars in [24]:
+                    for cooldown_bars in [6, 12]:
+                        for session_policy in [
+                            "all_sessions",
+                            "exclude_london_new_york_overlap",
+                            "london_only_no_overlap",
+                            "asian_london_no_overlap"
+                        ]:
+                            candidate_tests.append({
+                                "stop_loss_pips": stop_loss_pips,
+                                "reward_risk": reward_risk,
+                                "max_hold_bars": max_hold_bars,
+                                "cooldown_bars": cooldown_bars,
+                                "session_policy": session_policy
+                            })
+
+        cost_stress_tests = [
+            {
+                "name": "baseline",
+                "spread_pips": 0.8,
+                "slippage_pips": 0.2,
+                "pf_required": baseline_pf_required,
+                "max_losing_streak_allowed": max_losing_streak_baseline,
+                "must_pass": True
+            },
+            {
+                "name": "moderate_stress",
+                "spread_pips": 1.0,
+                "slippage_pips": 0.5,
+                "pf_required": moderate_pf_required,
+                "max_losing_streak_allowed": max_losing_streak_moderate,
+                "must_pass": True
+            },
+            {
+                "name": "harsh_stress",
+                "spread_pips": 1.2,
+                "slippage_pips": 0.8,
+                "pf_required": 1.0,
+                "max_losing_streak_allowed": 5,
+                "must_pass": False
+            }
+        ]
+
+        def timeframe_minutes_local(tf: str):
+            t = str(tf).upper().strip()
+            if t.startswith("M"):
+                return int(t.replace("M", ""))
+            if t.startswith("H"):
+                return int(t.replace("H", "")) * 60
+            if t in ["1H", "60MIN", "60M"]:
+                return 60
+            return 15
+
+        confirm_minutes = timeframe_minutes_local(confirm_timeframe)
+
+        def get_confirm_slice_asof(decision_time):
+            decision_ts = pd.Timestamp(decision_time)
+            close_times = confirm_df["datetime"].apply(
+                lambda x: pd.Timestamp(x) + pd.Timedelta(minutes=confirm_minutes)
+            )
+            return confirm_df[close_times <= decision_ts].reset_index(drop=True)
+
+        def session_allowed(session_context, policy: str):
+            sessions = set(session_context or [])
+
+            if policy == "all_sessions":
+                return True
+
+            if policy == "exclude_london_new_york_overlap":
+                return "london_new_york_overlap" not in sessions
+
+            if policy == "london_only_no_overlap":
+                return (
+                    "london_session" in sessions
+                    and "london_new_york_overlap" not in sessions
+                )
+
+            if policy == "asian_london_no_overlap":
+                return (
+                    ("asian_session" in sessions or "london_session" in sessions)
+                    and "london_new_york_overlap" not in sessions
+                )
+
+            return True
+
+        def summarize_trades(trades):
+            total = len(trades)
+            wins = [t for t in trades if t["net_r_result"] > 0]
+            losses = [t for t in trades if t["net_r_result"] < 0]
+            breakeven = [t for t in trades if t["net_r_result"] == 0]
+
+            gross_win_r = sum(t["net_r_result"] for t in wins)
+            gross_loss_r = abs(sum(t["net_r_result"] for t in losses))
+
+            total_r = sum(t["net_r_result"] for t in trades)
+            avg_r = total_r / total if total else 0
+            win_rate = (len(wins) / total) * 100 if total else 0
+
+            if gross_loss_r > 0:
+                pf = gross_win_r / gross_loss_r
+            elif gross_win_r > 0:
+                pf = 999.0
+            else:
+                pf = None
+
+            max_ls = 0
+            cur_ls = 0
+
+            for t in trades:
+                if t["net_r_result"] < 0:
+                    cur_ls += 1
+                    max_ls = max(max_ls, cur_ls)
+                else:
+                    cur_ls = 0
+
+            return {
+                "trades_taken": total,
+                "wins": len(wins),
+                "losses": len(losses),
+                "breakeven": len(breakeven),
+                "win_rate_percent": round(win_rate, 2),
+                "total_r": round(total_r, 3),
+                "average_r": round(avg_r, 3),
+                "profit_factor": round(pf, 3) if pf is not None else None,
+                "max_losing_streak": max_ls
+            }
+
+        def summarize_windows(trades, windows_count):
+            grouped = {}
+            for t in trades:
+                w = int(t.get("window_number", 0))
+                grouped.setdefault(w, []).append(t)
+
+            window_results = []
+            for w in range(1, windows_count + 1):
+                summary = summarize_trades(grouped.get(w, []))
+                positive = (
+                    summary["trades_taken"] > 0
+                    and summary["total_r"] > 0
+                    and (summary["profit_factor"] or 0) >= 1.0
+                )
+                window_results.append({
+                    "window_number": w,
+                    "summary": summary,
+                    "positive": bool(positive)
+                })
+
+            return window_results
+
+        def simulate_candidate(candidate, cost_model):
+            stop_loss_pips = float(candidate["stop_loss_pips"])
+            reward_risk = float(candidate["reward_risk"])
+            max_hold_bars = int(candidate["max_hold_bars"])
+            cooldown_bars = int(candidate["cooldown_bars"])
+            session_policy = candidate["session_policy"]
+
+            spread_pips = float(cost_model["spread_pips"])
+            slippage_pips = float(cost_model["slippage_pips"])
+            total_cost_pips = spread_pips + slippage_pips
+            cost_r = total_cost_pips / stop_loss_pips if stop_loss_pips > 0 else 0
+
+            spread_filter = evaluate_spread_filter(spread_pips, 1.5)
+            if spread_filter is None:
+                spread_filter = {
+                    "spread_status": "error",
+                    "trade_allowed": False,
+                    "reason": "Spread filter returned None."
+                }
+
+            risk_gate = evaluate_low_capital_risk_gate(
+                account_balance=account_balance,
+                risk_percent=risk_percent,
+                stop_loss_pips=stop_loss_pips,
+                pip_value_per_standard_lot=pip_value_per_standard_lot,
+                broker_min_lot_size=broker_min_lot_size,
+                broker_lot_step=broker_lot_step
+            )
+
+            if risk_gate is None:
+                risk_gate = {
+                    "risk_gate_status": "error",
+                    "risk_gate_passed": False,
+                    "reason": "Risk gate returned None."
+                }
+
+            trades = []
+            block_counts = {}
+            raw_signal_counts = {"BUY": 0, "SELL": 0, "HOLD": 0}
+
+            def add_block(reason):
+                block_counts[reason] = block_counts.get(reason, 0) + 1
+
+            if not spread_filter.get("trade_allowed", True):
+                return {
+                    "cost_model": cost_model["name"],
+                    "summary": summarize_trades([]),
+                    "passed": False,
+                    "block_counts": {"Spread filter blocked all trades.": 1},
+                    "raw_signal_counts": raw_signal_counts,
+                    "risk_gate": risk_gate,
+                    "spread_filter": spread_filter,
+                    "windows": []
+                }
+
+            if not risk_gate.get("risk_gate_passed", True):
+                return {
+                    "cost_model": cost_model["name"],
+                    "summary": summarize_trades([]),
+                    "passed": False,
+                    "block_counts": {"Risk gate blocked all trades.": 1},
+                    "raw_signal_counts": raw_signal_counts,
+                    "risk_gate": risk_gate,
+                    "spread_filter": spread_filter,
+                    "windows": []
+                }
+
+            usable_start = max(220, int(candidate.get("swing_lookback", 12)) + 10)
+            usable_end = len(entry_df) - max_hold_bars - 1
+            usable_length = usable_end - usable_start
+            window_size = int(usable_length / walkforward_windows) if walkforward_windows > 0 else usable_length
+
+            if usable_length <= 0:
+                return {
+                    "cost_model": cost_model["name"],
+                    "summary": summarize_trades([]),
+                    "passed": False,
+                    "block_counts": {"Not enough usable candles.": 1},
+                    "raw_signal_counts": raw_signal_counts,
+                    "risk_gate": risk_gate,
+                    "spread_filter": spread_filter,
+                    "windows": []
+                }
+
+            last_trade_index = -999999
+
+            for i in range(usable_start, usable_end):
+                entry_slice = entry_df.iloc[:i + 1].reset_index(drop=True)
+                current = entry_slice.iloc[-1]
+                decision_time = current["datetime"]
+
+                confirm_slice = get_confirm_slice_asof(decision_time)
+                if len(confirm_slice) < 210:
+                    add_block("Not enough confirmed M15 candles.")
+                    continue
+
+                m15_bias_obj = build_htf_structure_bias_v1(confirm_slice, label=confirm_timeframe.upper())
+                m15_bias = m15_bias_obj.get("bias", "unknown")
+
+                signal = build_sweep_reclaim_signal_v1(
+                    entry_slice,
+                    htf_bias=m15_bias,
+                    swing_lookback=12,
+                    reclaim_buffer_pips=1.0,
+                    pip_size=pip_size
+                )
+
+                if signal is None:
+                    signal = {"action": "HOLD", "reason": "Signal returned None."}
+
+                raw_action = signal.get("action", "HOLD")
+                raw_signal_counts[raw_action] = raw_signal_counts.get(raw_action, 0) + 1
+
+                # Winner-candidate rule: BUY only.
+                if raw_action != "BUY":
+                    if raw_action == "SELL":
+                        add_block("SELL disabled by BUY-only gauntlet.")
+                    continue
+
+                if cooldown_bars > 0 and (i - last_trade_index) <= cooldown_bars:
+                    add_block("Cooldown blocked clustered trade.")
+                    continue
+
+                execution_bar = entry_df.iloc[i + 1]
+                entry_price = execution_bar["open"]
+                entry_time = execution_bar["datetime"]
+                session_context = classify_trading_session(pd.Timestamp(entry_time))
+
+                if not session_allowed(session_context, session_policy):
+                    add_block(f"Session policy blocked trade: {session_policy}")
+                    continue
+
+                sl_distance = stop_loss_pips * pip_size
+                tp_distance = stop_loss_pips * reward_risk * pip_size
+
+                stop_price = entry_price - sl_distance
+                target_price = entry_price + tp_distance
+
+                outcome = "timeout"
+                gross_r_result = 0.0
+                exit_time = None
+
+                final_j = min(i + 1 + max_hold_bars, len(entry_df) - 1)
+
+                for j in range(i + 1, final_j + 1):
+                    bar = entry_df.iloc[j]
+                    high = bar["high"]
+                    low = bar["low"]
+
+                    hit_stop = low <= stop_price
+                    hit_target = high >= target_price
+
+                    # Conservative rule: if TP and SL hit in same candle, count loss.
+                    if hit_stop and hit_target:
+                        outcome = "loss"
+                        gross_r_result = -1.0
+                        exit_time = bar["datetime"]
+                        break
+
+                    if hit_stop:
+                        outcome = "loss"
+                        gross_r_result = -1.0
+                        exit_time = bar["datetime"]
+                        break
+
+                    if hit_target:
+                        outcome = "win"
+                        gross_r_result = reward_risk
+                        exit_time = bar["datetime"]
+                        break
+
+                if outcome == "timeout":
+                    timeout_bar = entry_df.iloc[final_j]
+                    exit_price = timeout_bar["close"]
+                    exit_time = timeout_bar["datetime"]
+
+                    pnl_pips = (exit_price - entry_price) / pip_size
+                    gross_r_result = round(pnl_pips / stop_loss_pips, 3)
+
+                    if gross_r_result > 0:
+                        outcome = "timeout_win"
+                    elif gross_r_result < 0:
+                        outcome = "timeout_loss"
+                    else:
+                        outcome = "breakeven"
+
+                net_r_result = round(gross_r_result - cost_r, 3)
+                last_trade_index = i
+
+                window_number = int(((i - usable_start) / window_size) + 1) if window_size > 0 else 1
+                window_number = min(window_number, walkforward_windows)
+
+                trades.append({
+                    "decision_time": decision_time,
+                    "entry_time": entry_time,
+                    "exit_time": exit_time,
+                    "action": "BUY",
+                    "m15_bias": m15_bias,
+                    "window_number": window_number,
+                    "session_context": session_context,
+                    "session_policy": session_policy,
+                    "outcome": outcome,
+                    "gross_r_result": round(gross_r_result, 3),
+                    "cost_r": round(cost_r, 3),
+                    "net_r_result": net_r_result,
+                    "signal_reason": signal.get("reason")
+                })
+
+            summary = summarize_trades(trades)
+            windows = summarize_windows(trades, walkforward_windows)
+            positive_windows = [w for w in windows if w["positive"]]
+
+            pf = summary["profit_factor"] or 0
+
+            passed = (
+                summary["trades_taken"] >= min_total_trades_required
+                and summary["total_r"] > 0
+                and pf >= float(cost_model["pf_required"])
+                and summary["max_losing_streak"] <= int(cost_model["max_losing_streak_allowed"])
+                and len(positive_windows) >= min_positive_windows_required
+            )
+
+            return {
+                "cost_model": cost_model["name"],
+                "spread_pips": spread_pips,
+                "slippage_pips": slippage_pips,
+                "total_cost_pips": round(total_cost_pips, 3),
+                "cost_r_per_trade": round(cost_r, 3),
+                "must_pass": bool(cost_model["must_pass"]),
+                "passed": bool(passed),
+                "summary": summary,
+                "positive_window_count": len(positive_windows),
+                "windows": windows,
+                "block_counts": block_counts,
+                "raw_signal_counts": raw_signal_counts,
+                "risk_gate": risk_gate,
+                "spread_filter": spread_filter,
+                "recent_trades_sample": trades[-8:]
+            }
+
+        gauntlet_results = []
+
+        for candidate in candidate_tests:
+            stress_results = []
+
+            for cost_model in cost_stress_tests:
+                result = simulate_candidate(candidate, cost_model)
+                stress_results.append(result)
+
+            mandatory = [r for r in stress_results if r.get("must_pass")]
+            mandatory_passed = all(r.get("passed") for r in mandatory)
+
+            baseline = next((r for r in stress_results if r["cost_model"] == "baseline"), None)
+            moderate = next((r for r in stress_results if r["cost_model"] == "moderate_stress"), None)
+            harsh = next((r for r in stress_results if r["cost_model"] == "harsh_stress"), None)
+
+            baseline_summary = baseline.get("summary", {}) if baseline else {}
+            moderate_summary = moderate.get("summary", {}) if moderate else {}
+            harsh_summary = harsh.get("summary", {}) if harsh else {}
+
+            baseline_pf = baseline_summary.get("profit_factor") or 0
+            moderate_pf = moderate_summary.get("profit_factor") or 0
+            harsh_pf = harsh_summary.get("profit_factor") or 0
+
+            rank_score = (
+                (baseline_summary.get("total_r", 0) * 10)
+                + (baseline_summary.get("average_r", 0) * 100)
+                + (baseline_pf * 6)
+                + (moderate_summary.get("total_r", 0) * 8)
+                + (moderate_pf * 4)
+                + (harsh_summary.get("total_r", 0) * 3)
+                + (harsh_pf * 2)
+                - (baseline_summary.get("max_losing_streak", 99) * 4)
+                - (moderate_summary.get("max_losing_streak", 99) * 3)
+            )
+
+            if not mandatory_passed:
+                rank_score -= 100
+
+            gauntlet_results.append({
+                "candidate": candidate,
+                "mandatory_passed": bool(mandatory_passed),
+                "rank_score": round(rank_score, 3),
+                "stress_results": stress_results
+            })
+
+        ranked = sorted(
+            gauntlet_results,
+            key=lambda x: (
+                x.get("mandatory_passed", False),
+                x.get("rank_score", -999)
+            ),
+            reverse=True
+        )
+
+        champion = ranked[0] if ranked else None
+        passed_candidates = [r for r in ranked if r.get("mandatory_passed")]
+
+        verdict = "no_winner_candidate_validated"
+
+        if champion and champion.get("mandatory_passed"):
+            verdict = "winner_candidate_found_research_only"
+        elif champion:
+            verdict = "no_candidate_passed_full_gauntlet"
+
+        return make_json_safe({
+            "status": "ok",
+            "engine_version": "quant_backtest_sweep_reclaim_buyonly_gauntlet_v1",
+            "strategy_mode": "buyonly_sweep_reclaim_gauntlet_v1",
+            "asset_class": asset_class,
+            "symbol": symbol.upper(),
+            "normalized_symbol": normalized_symbol,
+            "entry_timeframe": entry_timeframe.upper(),
+            "confirm_timeframe": confirm_timeframe.upper(),
+            "lookback_bars": lookback_bars,
+            "gauntlet_rules": {
+                "direction": "BUY_ONLY",
+                "sell_trades": "disabled",
+                "confirmed_m15_asof_logic": True,
+                "min_total_trades_required": min_total_trades_required,
+                "min_positive_windows_required": min_positive_windows_required,
+                "baseline_pf_required": baseline_pf_required,
+                "moderate_pf_required": moderate_pf_required,
+                "max_losing_streak_baseline": max_losing_streak_baseline,
+                "max_losing_streak_moderate": max_losing_streak_moderate
+            },
+            "candidate_space": candidate_tests,
+            "cost_stress_tests": cost_stress_tests,
+            "cached_data": {
+                "entry_fetch_once": True,
+                "confirm_fetch_once": True,
+                "entry_candles_used": len(entry_df),
+                "confirm_candles_used": len(confirm_df),
+                "entry_confirmed_candle_mode": {k: v for k, v in entry_confirmed_info.items() if k != "candles"},
+                "confirm_confirmed_candle_mode": {k: v for k, v in confirm_confirmed_info.items() if k != "candles"}
+            },
+            "verdict": verdict,
+            "passed_candidate_count": len(passed_candidates),
+            "champion_candidate": champion,
+            "top_10_candidates": ranked[:10],
+            "integrity_note": "Research only. This gauntlet is stricter than prior diagnostics but still does not guarantee future live profitability.",
+            "next_upgrade": "If a winner candidate passes, build a paper-trade decision endpoint with zero SELL logic and full risk kill-switches."
+        })
+
+    except Exception as e:
+        return make_json_safe({
+            "status": "error",
+            "engine_version": "quant_backtest_sweep_reclaim_buyonly_gauntlet_v1",
+            "strategy_mode": "buyonly_sweep_reclaim_gauntlet_v1",
+            "symbol": symbol,
+            "error": str(e),
+            "reason": "BUY-only gauntlet failed safely."
+        })
+
