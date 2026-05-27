@@ -1718,3 +1718,203 @@ def quant_backtest_decision_stack_v1(
             "reason": "Backtest failed safely."
         })
 
+
+@app.get("/quant/backtest-sweep-v1")
+def quant_backtest_sweep_v1(
+    asset_class: str = Query(default="forex"),
+    symbol: str = Query(default="EURUSD"),
+    entry_timeframe: str = Query(default="M5"),
+    confirm_timeframe: str = Query(default="M15"),
+    lookback_bars: int = Query(default=1000, ge=300, le=5000),
+    spread_pips: float = Query(default=0.8, ge=0),
+    max_allowed_spread_pips: float = Query(default=1.5, ge=0.1),
+    account_balance: float = Query(default=50.0, ge=1),
+    risk_percent: float = Query(default=1.0, ge=0.1, le=5.0),
+    pip_size: float = Query(default=0.0001, ge=0.00001),
+    pip_value_per_standard_lot: float = Query(default=10.0, ge=0.01),
+    broker_min_lot_size: float = Query(default=0.001, ge=0.0001),
+    broker_lot_step: float = Query(default=0.001, ge=0.0001),
+    min_trades_required: int = Query(default=5, ge=1, le=100)
+):
+    """
+    Backtest Sweep v1:
+    Runs multiple parameter combinations against the existing backtest endpoint.
+    This is for diagnostics and parameter sensitivity only, not proof of profitability.
+    """
+    try:
+        stop_loss_tests = [8, 10, 12, 15, 20]
+        reward_risk_tests = [1.0, 1.2, 1.5]
+        max_hold_tests = [12, 24, 36]
+
+        results = []
+
+        for sl in stop_loss_tests:
+            for rr in reward_risk_tests:
+                for hold in max_hold_tests:
+                    bt = quant_backtest_decision_stack_v1(
+                        asset_class=asset_class,
+                        symbol=symbol,
+                        entry_timeframe=entry_timeframe,
+                        confirm_timeframe=confirm_timeframe,
+                        lookback_bars=lookback_bars,
+                        spread_pips=spread_pips,
+                        max_allowed_spread_pips=max_allowed_spread_pips,
+                        account_balance=account_balance,
+                        risk_percent=risk_percent,
+                        stop_loss_pips=float(sl),
+                        reward_risk=float(rr),
+                        max_hold_bars=int(hold),
+                        pip_size=pip_size,
+                        pip_value_per_standard_lot=pip_value_per_standard_lot,
+                        broker_min_lot_size=broker_min_lot_size,
+                        broker_lot_step=broker_lot_step
+                    )
+
+                    if not isinstance(bt, dict):
+                        results.append({
+                            "status": "error",
+                            "stop_loss_pips": sl,
+                            "reward_risk": rr,
+                            "max_hold_bars": hold,
+                            "reason": "Backtest returned non-dict response."
+                        })
+                        continue
+
+                    if bt.get("status") != "ok":
+                        results.append({
+                            "status": "error",
+                            "stop_loss_pips": sl,
+                            "reward_risk": rr,
+                            "max_hold_bars": hold,
+                            "reason": bt.get("reason", "Backtest failed."),
+                            "error": bt.get("error")
+                        })
+                        continue
+
+                    perf = bt.get("performance", {})
+                    raw_counts = bt.get("raw_signal_counts", {})
+                    blocks = bt.get("block_counts", {})
+
+                    trades_taken = perf.get("trades_taken", 0)
+                    profit_factor = perf.get("profit_factor")
+                    total_r = perf.get("total_r", 0)
+                    avg_r = perf.get("average_r", 0)
+                    win_rate = perf.get("win_rate_percent", 0)
+                    max_losing_streak = perf.get("max_losing_streak", 0)
+
+                    # Ranking score: conservative and simple.
+                    # Penalize too few trades and long losing streaks.
+                    if trades_taken < min_trades_required:
+                        rank_score = -999
+                    else:
+                        pf_component = profit_factor if profit_factor is not None else 0
+                        rank_score = (
+                            (float(total_r) * 10)
+                            + (float(avg_r) * 100)
+                            + (float(pf_component) * 5)
+                            - (float(max_losing_streak) * 2)
+                        )
+
+                    results.append({
+                        "status": "ok",
+                        "stop_loss_pips": sl,
+                        "reward_risk": rr,
+                        "max_hold_bars": hold,
+                        "rank_score": round(rank_score, 3),
+                        "trades_taken": trades_taken,
+                        "wins": perf.get("wins", 0),
+                        "losses": perf.get("losses", 0),
+                        "win_rate_percent": win_rate,
+                        "total_r": total_r,
+                        "average_r": avg_r,
+                        "profit_factor": profit_factor,
+                        "max_losing_streak": max_losing_streak,
+                        "raw_signal_counts": raw_counts,
+                        "block_counts": blocks
+                    })
+
+        valid_results = [r for r in results if r.get("status") == "ok"]
+        error_results = [r for r in results if r.get("status") != "ok"]
+
+        ranked = sorted(
+            valid_results,
+            key=lambda x: (
+                x.get("rank_score", -999),
+                x.get("total_r", -999),
+                x.get("profit_factor") or 0,
+                -x.get("max_losing_streak", 999)
+            ),
+            reverse=True
+        )
+
+        profitable = [
+            r for r in valid_results
+            if r.get("trades_taken", 0) >= min_trades_required
+            and r.get("total_r", 0) > 0
+            and (r.get("profit_factor") or 0) > 1
+        ]
+
+        negative = [
+            r for r in valid_results
+            if r.get("trades_taken", 0) >= min_trades_required
+            and r.get("total_r", 0) <= 0
+        ]
+
+        best = ranked[0] if ranked else None
+
+        verdict = "not_enough_data"
+
+        if best:
+            if best.get("trades_taken", 0) < min_trades_required:
+                verdict = "not_enough_trades_to_trust"
+            elif best.get("total_r", 0) > 0 and (best.get("profit_factor") or 0) > 1:
+                verdict = "some_parameter_sets_show_potential_but_need_out_of_sample_validation"
+            else:
+                verdict = "current_strategy_stack_not_validated"
+
+        response = {
+            "status": "ok",
+            "engine_version": "quant_backtest_sweep_v1",
+            "asset_class": asset_class,
+            "symbol": symbol.upper(),
+            "entry_timeframe": entry_timeframe.upper(),
+            "confirm_timeframe": confirm_timeframe.upper(),
+            "lookback_bars": lookback_bars,
+            "sweep_space": {
+                "stop_loss_pips": stop_loss_tests,
+                "reward_risk": reward_risk_tests,
+                "max_hold_bars": max_hold_tests,
+                "combinations_tested": len(results),
+                "min_trades_required": min_trades_required
+            },
+            "shared_assumptions": {
+                "spread_pips": spread_pips,
+                "max_allowed_spread_pips": max_allowed_spread_pips,
+                "account_balance": account_balance,
+                "risk_percent": risk_percent,
+                "broker_min_lot_size": broker_min_lot_size,
+                "broker_lot_step": broker_lot_step,
+                "pip_size": pip_size,
+                "pip_value_per_standard_lot": pip_value_per_standard_lot
+            },
+            "verdict": verdict,
+            "best_result": best,
+            "top_10_results": ranked[:10],
+            "profitable_result_count": len(profitable),
+            "negative_result_count": len(negative),
+            "error_result_count": len(error_results),
+            "integrity_note": "Parameter sweep is diagnostic only. It can reveal sensitivity and overfitting risk, but it does not prove future profitability.",
+            "next_upgrade": "If no stable positive parameter zone appears, improve entry logic before adding execution."
+        }
+
+        return make_json_safe(response)
+
+    except Exception as e:
+        return make_json_safe({
+            "status": "error",
+            "engine_version": "quant_backtest_sweep_v1",
+            "symbol": symbol,
+            "error": str(e),
+            "reason": "Backtest sweep failed safely."
+        })
+
