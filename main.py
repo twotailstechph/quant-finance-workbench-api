@@ -981,7 +981,7 @@ def quant_forex_decision_stack_v1(
             final_action = "HOLD"
             hard_filters.append("Confidence score is below 60. Forced HOLD.")
 
-            if not spread_filter.get("trade_allowed", True):
+        if not spread_filter.get("trade_allowed", True):
             final_action = "HOLD"
             hard_filters.append("Spread is above allowed threshold. Forced HOLD.")
         
