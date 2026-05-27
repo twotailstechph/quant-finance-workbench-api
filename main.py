@@ -301,3 +301,149 @@ def calculate_confidence_score(signal: dict, latest: pd.Series):
         "label": confidence_label,
         "reasons": reasons
     }
+
+@app.get("/market/snapshot-v1-1")
+def market_snapshot_v1_1(
+    asset_class: str = Query(default="forex"),
+    symbol: str = Query(default="EURUSD"),
+    timeframe: str = Query(default="M5"),
+    lookback_bars: int = Query(default=300, ge=220, le=5000),
+    timezone: Optional[str] = Query(default="Asia/Manila")
+):
+    """
+    Market Snapshot v1.1:
+    Adds candle freshness, session label, EMA compression filter,
+    confidence score, and safer HOLD rules.
+    """
+    try:
+        normalized_symbol = normalize_symbol(symbol)
+        interval = normalize_timeframe(timeframe)
+
+        fetch_size = max(lookback_bars, 300)
+
+        candles = fetch_twelve_data_candles(
+            symbol=normalized_symbol,
+            interval=interval,
+            outputsize=fetch_size
+        )
+
+        if len(candles) < 220:
+            return {
+                "status": "error",
+                "symbol": symbol,
+                "normalized_symbol": normalized_symbol,
+                "timeframe": timeframe,
+                "interval": interval,
+                "final_action": "HOLD",
+                "reason": "Not enough candle data returned from provider.",
+                "candles_returned": len(candles),
+                "minimum_required": 220
+            }
+
+        candles = candles.tail(lookback_bars).reset_index(drop=True)
+        candles = calculate_indicators(candles)
+
+        signal = build_signal(candles)
+
+        latest = candles.iloc[-1]
+        previous = candles.iloc[-2]
+
+        freshness = check_candle_freshness(latest["datetime"], timeframe)
+        sessions = classify_trading_session(latest["datetime"])
+        confidence = calculate_confidence_score(signal, latest)
+
+        close = latest["close"]
+        ema_200 = latest["ema_200"]
+        atr_14 = latest["atr_14"]
+
+        ema_distance = abs(close - ema_200)
+        ema_distance_atr = ema_distance / atr_14 if atr_14 and atr_14 > 0 else None
+
+        compression_zone = False
+        if ema_distance_atr is not None:
+            compression_zone = ema_distance_atr <= 0.25
+
+        final_action = signal.get("action")
+        final_reason = signal.get("reason")
+        hard_filters = []
+
+        if not freshness["is_fresh"]:
+            final_action = "HOLD"
+            hard_filters.append("Latest candle appears stale. Forced HOLD.")
+
+        if compression_zone:
+            final_action = "HOLD"
+            hard_filters.append("Price is too close to EMA 200. Possible chop/compression. Forced HOLD.")
+
+        if confidence["score"] < 60:
+            if final_action in ["BUY", "SELL"]:
+                final_action = "HOLD"
+                hard_filters.append("Confidence score is below 60. Forced HOLD.")
+
+        warnings = signal.get("warnings", [])
+
+        if hard_filters:
+            warnings = warnings + hard_filters
+            final_reason = "One or more safety filters blocked the trade."
+
+        return {
+            "status": "ok",
+            "provider": "Twelve Data",
+            "engine_version": "market_snapshot_v1_1",
+            "asset_class": asset_class,
+            "symbol": symbol.upper(),
+            "normalized_symbol": normalized_symbol,
+            "timeframe": timeframe.upper(),
+            "provider_interval": interval,
+            "lookback_bars": lookback_bars,
+            "candles_used": len(candles),
+            "latest_candle_time": str(latest["datetime"]),
+            "previous_candle_time": str(previous["datetime"]),
+            "session_context": sessions,
+            "freshness": freshness,
+            "latest": {
+                "open": round_float(latest["open"]),
+                "high": round_float(latest["high"]),
+                "low": round_float(latest["low"]),
+                "close": round_float(latest["close"]),
+                "ema_200": round_float(latest["ema_200"]),
+                "ema_distance": round_float(ema_distance, 7),
+                "ema_distance_atr": round_float(ema_distance_atr, 3) if ema_distance_atr is not None else None,
+                "macd_line": round_float(latest["macd_line"], 7),
+                "macd_signal": round_float(latest["macd_signal"], 7),
+                "macd_histogram": round_float(latest["macd_histogram"], 7),
+                "rsi_14": round_float(latest["rsi_14"], 2),
+                "atr_14": round_float(latest["atr_14"], 7)
+            },
+            "previous": {
+                "close": round_float(previous["close"]),
+                "macd_line": round_float(previous["macd_line"], 7),
+                "macd_signal": round_float(previous["macd_signal"], 7),
+                "rsi_14": round_float(previous["rsi_14"], 2)
+            },
+            "trend_state": signal.get("trend_state"),
+            "macd_state": signal.get("macd_state"),
+            "rsi_state": signal.get("rsi_state"),
+            "compression_zone": compression_zone,
+            "raw_signal_action": signal.get("action"),
+            "final_action": final_action,
+            "reason": final_reason,
+            "confidence": confidence,
+            "checks": signal.get("checks"),
+            "hard_filters": hard_filters,
+            "warnings": warnings,
+            "integrity_note": "Analytical signal only. Not financial advice. Do not execute without broker-side risk controls.",
+            "next_upgrade": "Add spread filter, news filter, multi-timeframe confirmation, and backtest validation."
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "provider": "Twelve Data",
+            "engine_version": "market_snapshot_v1_1",
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "final_action": "HOLD",
+            "error": str(e),
+            "reason": "Market Snapshot v1.1 failed safely. Defaulting to HOLD."
+        }
