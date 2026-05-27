@@ -708,3 +708,78 @@ def market_snapshot_v1_1(
             "error": str(e),
             "reason": "Market Snapshot v1.1 failed safely. Defaulting to HOLD."
         }
+
+    return {
+        "action": action,
+        "reason": reason,
+        "trend_state": trend_state,
+        "macd_state": macd_state,
+        "rsi_state": rsi_state,
+        "checks": {
+            "price_above_ema_200": bool(price_above_ema_200),
+            "price_below_ema_200": bool(price_below_ema_200),
+            "macd_bullish_cross": bool(macd_bullish_cross),
+            "macd_bearish_cross": bool(macd_bearish_cross),
+            "rsi_healthy_buy": bool(rsi_healthy_buy),
+            "rsi_healthy_sell": bool(rsi_healthy_sell),
+            "rsi_overbought": bool(rsi_overbought),
+            "rsi_oversold": bool(rsi_oversold)
+        },
+        "warnings": warnings
+    }
+
+def build_higher_timeframe_bias(df: pd.DataFrame, label: str = "M15"):
+    """
+    Higher timeframe bias filter.
+    Uses close vs EMA 200 and MACD line vs signal line.
+    This does not create entries. It only confirms or blocks M5 entries.
+    """
+    if len(df) < 210:
+        return {
+            "timeframe": label,
+            "bias": "unknown",
+            "reason": "Not enough candles for higher-timeframe EMA 200 confirmation.",
+            "checks": {}
+        }
+
+    latest = df.iloc[-1]
+
+    close = latest["close"]
+    ema_200 = latest["ema_200"]
+    macd_line = latest["macd_line"]
+    macd_signal = latest["macd_signal"]
+    rsi_14 = latest["rsi_14"]
+
+    price_above_ema_200 = close > ema_200
+    price_below_ema_200 = close < ema_200
+    macd_bullish = macd_line > macd_signal
+    macd_bearish = macd_line < macd_signal
+
+    if price_above_ema_200 and macd_bullish:
+        bias = "bullish"
+        reason = f"{label} confirms bullish bias: price is above EMA 200 and MACD is bullish."
+    elif price_below_ema_200 and macd_bearish:
+        bias = "bearish"
+        reason = f"{label} confirms bearish bias: price is below EMA 200 and MACD is bearish."
+    else:
+        bias = "mixed"
+        reason = f"{label} bias is mixed or unclear."
+
+    return {
+        "timeframe": label,
+        "bias": bias,
+        "reason": reason,
+        "latest": {
+            "close": round_float(close),
+            "ema_200": round_float(ema_200),
+            "macd_line": round_float(macd_line, 7),
+            "macd_signal": round_float(macd_signal, 7),
+            "rsi_14": round_float(rsi_14, 2)
+        },
+        "checks": {
+            "price_above_ema_200": bool(price_above_ema_200),
+            "price_below_ema_200": bool(price_below_ema_200),
+            "macd_bullish": bool(macd_bullish),
+            "macd_bearish": bool(macd_bearish)
+        }
+    }
