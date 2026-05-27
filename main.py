@@ -318,18 +318,61 @@ def select_confirmed_candles(df: pd.DataFrame, timeframe: str):
 def evaluate_spread_filter(current_spread_pips: Optional[float], max_allowed_spread_pips: float = 1.5):
     """
     Spread filter / spread status gate.
-    For now, current_spread_pips is optional because the current provider does not supply broker spread.
-    Later, this should be connected to broker-side live bid/ask data.
+    Always returns a dictionary.
+    In research mode, unavailable spread does not block.
+    In live execution mode, broker-side spread should be required.
     """
-    if current_spread_pips is None:
+    try:
+        max_spread = float(max_allowed_spread_pips)
+
+        if current_spread_pips is None:
+            return {
+                "spread_status": "unavailable",
+                "trade_allowed": True,
+                "current_spread_pips": None,
+                "max_allowed_spread_pips": max_spread,
+                "reason": "Spread not provided. Not blocking in research mode, but live execution should require broker spread."
+            }
+
+        spread_value = float(current_spread_pips)
+
+        if spread_value < 0:
+            return {
+                "spread_status": "invalid",
+                "trade_allowed": False,
+                "current_spread_pips": spread_value,
+                "max_allowed_spread_pips": max_spread,
+                "reason": "Spread cannot be negative. Forced HOLD."
+            }
+
+        if spread_value <= max_spread:
+            return {
+                "spread_status": "normal",
+                "trade_allowed": True,
+                "current_spread_pips": spread_value,
+                "max_allowed_spread_pips": max_spread,
+                "reason": "Spread is within allowed threshold."
+            }
+
         return {
-            "spread_status": "unavailable",
-            "trade_allowed": True,
-            "current_spread_pips": None,
-            "max_allowed_spread_pips": max_allowed_spread_pips,
-            "reason": "Spread not provided. Not blocking in research mode, but live execution should require broker spread."
+            "spread_status": "elevated",
+            "trade_allowed": False,
+            "current_spread_pips": spread_value,
+            "max_allowed_spread_pips": max_spread,
+            "reason": "Spread is above allowed threshold. Trade should be blocked."
         }
-        
+
+    except Exception as e:
+        return {
+            "spread_status": "error",
+            "trade_allowed": False,
+            "current_spread_pips": current_spread_pips,
+            "max_allowed_spread_pips": max_allowed_spread_pips,
+            "reason": "Spread filter calculation failed. Forced HOLD.",
+            "error": str(e)
+        }
+
+
 def evaluate_low_capital_risk_gate(
     account_balance: Optional[float],
     risk_percent: float = 1.0,
